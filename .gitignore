@@ -1,0 +1,11 @@
+/bin/
+/build/
+/out/
+.vs/
+*.user
+*.sdf
+*.opensdf
+*.suo
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake

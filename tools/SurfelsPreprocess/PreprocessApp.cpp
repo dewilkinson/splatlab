@@ -961,52 +961,126 @@ namespace Surfels
 
     void PreprocessApp::InitStreamingSimulation()
     {
-        m_fullStreamingSurfels.clear();
+        m_allStreamChunks.clear();
+        m_lodTotalSurfels.clear();
+        m_lodResidentSurfels.clear();
 
-        // If a specific LOD level or raw model is active, stream that exact model
-        if (!m_rawSurfels.empty())
+        if (m_residentLODs.empty())
         {
-            m_fullStreamingSurfels = m_rawSurfels;
+            PrecacheResidentLODs();
         }
-        else if (!m_waveletResult.lodLevels.empty())
+
+        if (m_enableWavelet && !m_waveletResult.lodLevels.empty())
         {
-            int lodIdx = std::max(0, std::min((int)m_waveletResult.lodLevels.size() - 1, m_selectedPreviewLOD));
-            m_fullStreamingSurfels = m_waveletResult.lodLevels[lodIdx].surfels;
+            int numLODs = (int)m_waveletResult.lodLevels.size();
+            m_lodTotalSurfels.assign(numLODs, 0);
+            m_lodResidentSurfels.assign(numLODs, 0);
+
+            // Build hierarchical stream chunks
+            // Order: Coarsest Base level (numLODs - 1) down to Finest Detail level (0)
+            for (int lvl = numLODs - 1; lvl >= 0; lvl--)
+            {
+                const auto& levelSurfels = m_waveletResult.lodLevels[lvl].surfels;
+                m_lodTotalSurfels[lvl] = levelSurfels.size();
+
+                if (levelSurfels.empty()) continue;
+
+                size_t numPoints = levelSurfels.size();
+                size_t numChunks = (numPoints + 63) / 64;
+
+                for (size_t c = 0; c < numChunks; c++)
+                {
+                    size_t start = c * 64;
+                    size_t count = std::min((size_t)64, numPoints - start);
+
+                    StreamChunk sc;
+                    sc.lodLevel = lvl;
+                    sc.surfels.assign(levelSurfels.begin() + start, levelSurfels.begin() + start + count);
+                    sc.byteSize = sc.surfels.size() * (m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex));
+                    sc.isResident = false;
+                    sc.currentPriority = 0.0f;
+
+                    // Compute chunk bounding sphere
+                    XMFLOAT3 center = { 0, 0, 0 };
+                    for (const auto& s : sc.surfels)
+                    {
+                        center.x += s.position.x;
+                        center.y += s.position.y;
+                        center.z += s.position.z;
+                    }
+                    center.x /= (float)sc.surfels.size();
+                    center.y /= (float)sc.surfels.size();
+                    center.z /= (float)sc.surfels.size();
+
+                    float radius = 0.0f;
+                    for (const auto& s : sc.surfels)
+                    {
+                        float dx = s.position.x - center.x;
+                        float dy = s.position.y - center.y;
+                        float dz = s.position.z - center.z;
+                        radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz));
+                    }
+
+                    sc.center = center;
+                    sc.radius = radius;
+                    m_allStreamChunks.push_back(std::move(sc));
+                }
+            }
         }
         else
         {
-            m_fullStreamingSurfels = m_rendererRawSurfels;
+            // Single LOD fallback
+            const auto& fallbackSurfels = !m_rawSurfels.empty() ? m_rawSurfels : m_rendererRawSurfels;
+            m_lodTotalSurfels.assign(1, fallbackSurfels.size());
+            m_lodResidentSurfels.assign(1, 0);
+
+            size_t numPoints = fallbackSurfels.size();
+            size_t numChunks = (numPoints + 63) / 64;
+
+            for (size_t c = 0; c < numChunks; c++)
+            {
+                size_t start = c * 64;
+                size_t count = std::min((size_t)64, numPoints - start);
+
+                StreamChunk sc;
+                sc.lodLevel = 0;
+                sc.surfels.assign(fallbackSurfels.begin() + start, fallbackSurfels.begin() + start + count);
+                sc.byteSize = sc.surfels.size() * (m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex));
+                sc.isResident = false;
+                sc.currentPriority = 0.0f;
+
+                XMFLOAT3 center = { 0, 0, 0 };
+                for (const auto& s : sc.surfels)
+                {
+                    center.x += s.position.x;
+                    center.y += s.position.y;
+                    center.z += s.position.z;
+                }
+                center.x /= (float)sc.surfels.size();
+                center.y /= (float)sc.surfels.size();
+                center.z /= (float)sc.surfels.size();
+
+                float radius = 0.0f;
+                for (const auto& s : sc.surfels)
+                {
+                    float dx = s.position.x - center.x;
+                    float dy = s.position.y - center.y;
+                    float dz = s.position.z - center.z;
+                    radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz));
+                }
+
+                sc.center = center;
+                sc.radius = radius;
+                m_allStreamChunks.push_back(std::move(sc));
+            }
         }
 
-        if (m_fullStreamingSurfels.empty()) return;
-
-        // If Morton ordering is requested, sort so progressive refinement scans smoothly through 3D space
-        if (m_enableMortonOrder)
+        m_totalStreamBytes = 0.0f;
+        for (const auto& sc : m_allStreamChunks)
         {
-            float invEx = 1.0f / std::max(0.001f, m_extents.x);
-            float invEy = 1.0f / std::max(0.001f, m_extents.y);
-            float invEz = 1.0f / std::max(0.001f, m_extents.z);
-
-            std::sort(m_fullStreamingSurfels.begin(), m_fullStreamingSurfels.end(),
-                [&](const SurfelVertex& a, const SurfelVertex& b) {
-                    float nax = (a.position.x - m_aabbMin.x) * invEx;
-                    float nay = (a.position.y - m_aabbMin.y) * invEy;
-                    float naz = (a.position.z - m_aabbMin.z) * invEz;
-                    uint32_t ma = SpatialOctree::ComputeMorton30(nax, nay, naz);
-
-                    float nbx = (b.position.x - m_aabbMin.x) * invEx;
-                    float nby = (b.position.y - m_aabbMin.y) * invEy;
-                    float nbz = (b.position.z - m_aabbMin.z) * invEz;
-                    uint32_t mb = SpatialOctree::ComputeMorton30(nbx, nby, nbz);
-
-                    return ma < mb;
-                });
+            m_totalStreamBytes += (float)sc.byteSize;
         }
 
-        size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
-        m_totalStreamBytes = (float)(m_fullStreamingSurfels.size() * bytesPerSurfel);
-
-        // Ensure Ring Buffer capacity is large enough to hold the entire model
         float requiredMB = std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f));
         if (m_ringBufferCapacityMB < requiredMB)
         {
@@ -1020,11 +1094,176 @@ namespace Surfels
     {
         m_simulatedBytesDelivered = 0.0f;
         m_streamRefinementProgress = 0.0f;
+        m_evictedSurfelCount = 0;
 
-        if (m_fullStreamingSurfels.empty()) return;
+        for (auto& sc : m_allStreamChunks)
+        {
+            sc.isResident = false;
+        }
 
-        size_t initialPoints = std::min((size_t)1024, m_fullStreamingSurfels.size());
-        m_rendererRawSurfels.assign(m_fullStreamingSurfels.begin(), m_fullStreamingSurfels.begin() + initialPoints);
+        std::fill(m_lodResidentSurfels.begin(), m_lodResidentSurfels.end(), 0);
+
+        UpdateStreamingSimulation(0.0);
+    }
+
+    void PreprocessApp::UpdateStreamingSimulation(double dtSeconds)
+    {
+        if (!m_enableStreamingSimulation || m_allStreamChunks.empty())
+            return;
+
+        if (!m_isStreamingPaused)
+        {
+            if (m_unthrottledBandwidth)
+            {
+                m_simulatedBytesDelivered = m_totalStreamBytes;
+            }
+            else
+            {
+                float bandwidthBytesPerSec = m_bandwidthThrottleMBps * 1024.0f * 1024.0f;
+                float bytesTransferred = (float)(dtSeconds * bandwidthBytesPerSec);
+                m_simulatedBytesDelivered = std::min(m_totalStreamBytes, m_simulatedBytesDelivered + bytesTransferred);
+            }
+        }
+
+        m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
+
+        // 1. Extract Camera Position and 6 Frustum Planes
+        const float cy = cosf(m_pitch), sy = sinf(m_pitch);
+        const float sx = sinf(m_yaw), cx = cosf(m_yaw);
+        XMFLOAT3 eyePos(
+            m_target.x + m_distance * cy * sx,
+            m_target.y + m_distance * sy,
+            m_target.z + m_distance * cy * cx
+        );
+        XMVECTOR eye = XMLoadFloat3(&eyePos);
+        XMVECTOR at = XMLoadFloat3(&m_target);
+        XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        XMMATRIX view = XMMatrixLookAtRH(eye, at, worldUp);
+        XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, (float)m_Width / (float)std::max(1, (int)m_Height), 0.1f, 500.0f);
+        XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+
+        XMFLOAT4X4 vp;
+        XMStoreFloat4x4(&vp, viewProj);
+        struct Plane4 { float a, b, c, d; } planes[6];
+        planes[0] = { vp._14 + vp._11, vp._24 + vp._21, vp._34 + vp._31, vp._44 + vp._41 };
+        planes[1] = { vp._14 - vp._11, vp._24 - vp._21, vp._34 - vp._31, vp._44 - vp._41 };
+        planes[2] = { vp._14 + vp._12, vp._24 + vp._22, vp._34 + vp._32, vp._44 + vp._42 };
+        planes[3] = { vp._14 - vp._12, vp._24 - vp._22, vp._34 - vp._32, vp._44 - vp._42 };
+        planes[4] = { vp._13, vp._23, vp._33, vp._43 };
+        planes[5] = { vp._14 - vp._13, vp._24 - vp._23, vp._34 - vp._33, vp._44 - vp._43 };
+
+        for (int i = 0; i < 6; i++)
+        {
+            float len = sqrtf(planes[i].a * planes[i].a + planes[i].b * planes[i].b + planes[i].c * planes[i].c);
+            if (len > 1e-6f)
+            {
+                float invL = 1.0f / len;
+                planes[i].a *= invL;
+                planes[i].b *= invL;
+                planes[i].c *= invL;
+                planes[i].d *= invL;
+            }
+        }
+
+        auto IsSphereInFrustum = [&](const XMFLOAT3& center, float radius) -> bool
+        {
+            for (int i = 0; i < 6; i++)
+            {
+                if (planes[i].a * center.x + planes[i].b * center.y + planes[i].c * center.z + planes[i].d < -radius)
+                    return false;
+            }
+            return true;
+        };
+
+        // 2. Score and sort all chunks by Level Priority + Frustum & Proximity Priority
+        std::vector<size_t> chunkOrder(m_allStreamChunks.size());
+        for (size_t i = 0; i < chunkOrder.size(); i++) chunkOrder[i] = i;
+
+        for (size_t i = 0; i < m_allStreamChunks.size(); i++)
+        {
+            auto& chunk = m_allStreamChunks[i];
+            // Coarse base levels (higher lodLevel index) always stream first
+            float levelWeight = (float)chunk.lodLevel * 1000000.0f;
+
+            if (m_prioritizeFrustumAndProximity)
+            {
+                float dx = chunk.center.x - eyePos.x;
+                float dy = chunk.center.y - eyePos.y;
+                float dz = chunk.center.z - eyePos.z;
+                float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                bool inFrustum = IsSphereInFrustum(chunk.center, chunk.radius);
+
+                // In-frustum bonus + close proximity bonus
+                float frustumBonus = inFrustum ? 500000.0f : 0.0f;
+                float proximityScore = -dist * 10.0f;
+
+                chunk.currentPriority = levelWeight + frustumBonus + proximityScore;
+            }
+            else
+            {
+                chunk.currentPriority = levelWeight;
+            }
+        }
+
+        std::sort(chunkOrder.begin(), chunkOrder.end(), [&](size_t a, size_t b) {
+            return m_allStreamChunks[a].currentPriority > m_allStreamChunks[b].currentPriority;
+        });
+
+        // 3. Deliver stream packets within bandwidth budget & GPU Ring Buffer limits
+        float maxResidentBytes = m_ringBufferCapacityMB * 1024.0f * 1024.0f;
+        float deliveredBytesAccum = 0.0f;
+        float residentBytesAccum = 0.0f;
+
+        std::fill(m_lodResidentSurfels.begin(), m_lodResidentSurfels.end(), 0);
+        std::vector<SurfelVertex> newResidentSurfels;
+
+        size_t evictedCount = 0;
+
+        for (size_t idx : chunkOrder)
+        {
+            auto& chunk = m_allStreamChunks[idx];
+            float chunkBytes = (float)chunk.byteSize;
+
+            if (deliveredBytesAccum + chunkBytes <= m_simulatedBytesDelivered || m_unthrottledBandwidth)
+            {
+                deliveredBytesAccum += chunkBytes;
+
+                if (residentBytesAccum + chunkBytes <= maxResidentBytes)
+                {
+                    residentBytesAccum += chunkBytes;
+                    chunk.isResident = true;
+                    if (chunk.lodLevel >= 0 && chunk.lodLevel < (int)m_lodResidentSurfels.size())
+                    {
+                        m_lodResidentSurfels[chunk.lodLevel] += chunk.surfels.size();
+                    }
+                    newResidentSurfels.insert(newResidentSurfels.end(), chunk.surfels.begin(), chunk.surfels.end());
+                }
+                else
+                {
+                    // Evicted from ring buffer due to capacity limit
+                    chunk.isResident = false;
+                    evictedCount += chunk.surfels.size();
+                }
+            }
+            else
+            {
+                chunk.isResident = false;
+            }
+        }
+
+        m_evictedSurfelCount = evictedCount;
+
+        if (newResidentSurfels.empty() && !m_allStreamChunks.empty())
+        {
+            const auto& firstChunk = m_allStreamChunks[chunkOrder[0]];
+            newResidentSurfels = firstChunk.surfels;
+            if (firstChunk.lodLevel >= 0 && firstChunk.lodLevel < (int)m_lodResidentSurfels.size())
+            {
+                m_lodResidentSurfels[firstChunk.lodLevel] = firstChunk.surfels.size();
+            }
+        }
+
+        m_rendererRawSurfels = std::move(newResidentSurfels);
         SpatialOctree::PartitionIntoMeshletChunks(m_rendererRawSurfels, m_rendererMeshletChunks, 64, m_enableMortonOrder);
         m_rendererSurfels = Quantizer::QuantizeSurfels(m_rendererRawSurfels, m_aabbMin, m_aabbMax);
 
@@ -1033,69 +1272,6 @@ namespace Surfels
         m_state.pSurfels = m_rendererSurfels.data();
         m_state.pRawSurfels = m_rendererRawSurfels.data();
         m_state.pChunks = m_rendererMeshletChunks.data();
-    }
-
-    void PreprocessApp::UpdateStreamingSimulation(double dtSeconds)
-    {
-        if (!m_enableStreamingSimulation || m_isStreamingPaused || m_fullStreamingSurfels.empty())
-            return;
-
-        if (m_unthrottledBandwidth)
-        {
-            m_simulatedBytesDelivered = m_totalStreamBytes;
-        }
-        else
-        {
-            float bandwidthBytesPerSec = m_bandwidthThrottleMBps * 1024.0f * 1024.0f;
-            float bytesTransferred = (float)(dtSeconds * bandwidthBytesPerSec);
-            m_simulatedBytesDelivered = std::min(m_totalStreamBytes, m_simulatedBytesDelivered + bytesTransferred);
-        }
-
-        m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
-
-        size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
-
-        // 1. Total points received across network stream so far
-        size_t streamHead = (m_streamRefinementProgress >= 0.999f)
-            ? m_fullStreamingSurfels.size()
-            : (size_t)(m_simulatedBytesDelivered / bytesPerSurfel);
-        streamHead = std::max((size_t)64, std::min(m_fullStreamingSurfels.size(), streamHead));
-
-        // 2. Physical GPU Ring Buffer capacity in points
-        size_t ringBufferMaxPoints = (size_t)((m_ringBufferCapacityMB * 1024.0f * 1024.0f) / bytesPerSurfel);
-        ringBufferMaxPoints = std::max((size_t)64, ringBufferMaxPoints);
-
-        // 3. FIFO Slot Eviction: When streamHead exceeds ring buffer capacity, evict earliest slots
-        size_t streamStart = 0;
-        if (streamHead > ringBufferMaxPoints)
-        {
-            streamStart = streamHead - ringBufferMaxPoints;
-            m_evictedSurfelCount = streamStart;
-        }
-        else
-        {
-            m_evictedSurfelCount = 0;
-        }
-
-        size_t activeCount = streamHead - streamStart;
-
-        static size_t lastHead = 0;
-        static size_t lastStart = 0;
-        if (streamHead != lastHead || streamStart != lastStart)
-        {
-            lastHead = streamHead;
-            lastStart = streamStart;
-
-            m_rendererRawSurfels.assign(m_fullStreamingSurfels.begin() + streamStart, m_fullStreamingSurfels.begin() + streamHead);
-            SpatialOctree::PartitionIntoMeshletChunks(m_rendererRawSurfels, m_rendererMeshletChunks, 64, m_enableMortonOrder);
-            m_rendererSurfels = Quantizer::QuantizeSurfels(m_rendererRawSurfels, m_aabbMin, m_aabbMax);
-
-            m_state.surfelCount = (uint32_t)m_rendererSurfels.size();
-            m_state.chunkCount = (uint32_t)m_rendererMeshletChunks.size();
-            m_state.pSurfels = m_rendererSurfels.data();
-            m_state.pRawSurfels = m_rendererRawSurfels.data();
-            m_state.pChunks = m_rendererMeshletChunks.data();
-        }
     }
 
     void PreprocessApp::ProcessAndExport(const std::string& outputPath)
@@ -1718,6 +1894,9 @@ namespace Surfels
                         ImGui::TextColored(m_isStreamingPaused ? ImVec4(1.0f, 0.6f, 0.2f, 1.0f) : ImVec4(0.3f, 1.0f, 0.4f, 1.0f),
                             m_isStreamingPaused ? "[PAUSED]" : "[STREAMING]");
 
+                        ImGui::Checkbox("Prioritize View Frustum & Proximity", &m_prioritizeFrustumAndProximity);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Streams the coarsest base LOD first, followed by high-detail chunks in the current camera frustum and near the viewer.");
+
                         // Bandwidth Preset Buttons
                         ImGui::Text("Network Profiles:");
                         if (ImGui::Button("3G (1.5 MB/s)", ImVec2(85, 22)))
@@ -2165,7 +2344,7 @@ namespace Surfels
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         float availWidth = ImGui::GetContentRegionAvailWidth();
 
-        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f), "Resident Block Span by LOD Tier:");
+        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f), "Resident Block Span by LOD Tier (Coarse to Fine):");
         ImGui::Spacing();
 
         for (int lodIdx = 0; lodIdx < numLODs; lodIdx++)
@@ -2175,35 +2354,22 @@ namespace Surfels
             size_t totalPts = lodData.rawSurfels.size();
             float totalMB = (float)(totalPts * (m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex))) / (1024.0f * 1024.0f);
 
-            float startFraction = 0.0f;
-            float endFraction = 1.0f;
+            float fraction = 1.0f;
             uint32_t residentBlocks = totalBlocks;
 
-            if (m_enableStreamingSimulation && !m_fullStreamingSurfels.empty())
+            if (m_enableStreamingSimulation)
             {
-                // Progressive Network Streaming mode: active window in GPU ring buffer
-                float fullCount = (float)m_fullStreamingSurfels.size();
-                float residentCount = (float)m_state.surfelCount;
-                float evictedCount = (float)m_evictedSurfelCount;
+                size_t residentPts = (lodIdx < (int)m_lodResidentSurfels.size()) ? m_lodResidentSurfels[lodIdx] : 0;
+                size_t totalLevelPts = (lodIdx < (int)m_lodTotalSurfels.size() && m_lodTotalSurfels[lodIdx] > 0) ? m_lodTotalSurfels[lodIdx] : totalPts;
 
-                startFraction = std::max(0.0f, std::min(1.0f, evictedCount / fullCount));
-                float residentRatio = std::max(0.0f, std::min(1.0f, residentCount / fullCount));
-                endFraction = std::min(1.0f, startFraction + residentRatio);
-
-                residentBlocks = (uint32_t)std::round(totalBlocks * residentRatio);
-            }
-            else
-            {
-                // Standard mode: fully resident
-                startFraction = 0.0f;
-                endFraction = 1.0f;
-                residentBlocks = totalBlocks;
+                fraction = (totalLevelPts > 0) ? std::min(1.0f, (float)residentPts / (float)totalLevelPts) : 0.0f;
+                residentBlocks = (uint32_t)std::round(totalBlocks * fraction);
             }
 
-            float residentPct = (endFraction - startFraction) * 100.0f;
+            float residentPct = fraction * 100.0f;
             bool isActiveLOD = (lodIdx == m_selectedPreviewLOD);
 
-            // Row Header with block count and memory footprint
+            // Row Header
             if (isActiveLOD)
             {
                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "LOD %d%s [%.1f%% Resident] - %u / %u blocks (%zu pts | %.1f MB) [ACTIVE VIEW]",
@@ -2229,46 +2395,38 @@ namespace Surfels
             drawList->AddRectFilled(p0, ImVec2(p0.x + availWidth, p0.y + barHeight), IM_COL32(16, 18, 22, 255), 2.0f);
             drawList->AddRect(p0, ImVec2(p0.x + availWidth, p0.y + barHeight), IM_COL32(32, 35, 42, 255), 2.0f);
 
+            int litSegments = (int)std::round(fraction * numSegments);
+
             for (int s = 0; s < numSegments; s++)
             {
-                float segStart = (float)s / (float)numSegments;
-                float segEnd = (float)(s + 1) / (float)numSegments;
-
-                bool isLit = (segEnd > startFraction) && (segStart < endFraction) && (residentPct > 0.001f);
+                bool isLit = (s < litSegments) && (residentPct > 0.001f);
 
                 ImVec2 segMin = ImVec2(p0.x + s * (segWidth + gap) + 1.0f, p0.y + 1.5f);
                 ImVec2 segMax = ImVec2(segMin.x + segWidth - 1.0f, p0.y + barHeight - 1.5f);
 
                 if (isLit)
                 {
-                    // Multi-tier Equalizer coloring based on position along the frequency/LOD band
                     ImU32 colBase;
                     ImU32 colHighlight;
 
                     float segFrac = (float)s / (float)numSegments;
                     if (segFrac < 0.60f)
                     {
-                        // Green tier (0 - 60%)
                         colBase = IM_COL32(35, 205, 85, 255);
                         colHighlight = IM_COL32(95, 255, 140, 255);
                     }
                     else if (segFrac < 0.85f)
                     {
-                        // Amber / Yellow tier (60 - 85%)
                         colBase = IM_COL32(250, 180, 25, 255);
                         colHighlight = IM_COL32(255, 220, 90, 255);
                     }
                     else
                     {
-                        // Cyan / Aqua tier (85 - 100%)
                         colBase = IM_COL32(30, 200, 250, 255);
                         colHighlight = IM_COL32(130, 235, 255, 255);
                     }
 
-                    // Main illuminated LED segment
                     drawList->AddRectFilled(segMin, segMax, colBase, 1.5f);
-
-                    // Glossy top edge highlight
                     drawList->AddLine(
                         ImVec2(segMin.x + 1.0f, segMin.y + 1.0f),
                         ImVec2(segMax.x - 1.0f, segMin.y + 1.0f),
@@ -2276,7 +2434,6 @@ namespace Surfels
                 }
                 else
                 {
-                    // Dark Gray unilluminated segment
                     drawList->AddRectFilled(segMin, segMax, IM_COL32(30, 32, 38, 255), 1.5f);
                     drawList->AddRect(segMin, segMax, IM_COL32(20, 22, 26, 255), 1.5f);
                 }

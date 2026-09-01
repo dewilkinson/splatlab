@@ -1042,31 +1042,51 @@ namespace Surfels
 
         if (m_unthrottledBandwidth)
         {
-            float maxAllowedBytes = std::min(m_totalStreamBytes, m_ringBufferCapacityMB * 1024.0f * 1024.0f);
-            m_simulatedBytesDelivered = maxAllowedBytes;
+            m_simulatedBytesDelivered = m_totalStreamBytes;
         }
         else
         {
             float bandwidthBytesPerSec = m_bandwidthThrottleMBps * 1024.0f * 1024.0f;
             float bytesTransferred = (float)(dtSeconds * bandwidthBytesPerSec);
-            m_simulatedBytesDelivered += bytesTransferred;
-
-            float maxAllowedBytes = std::min(m_totalStreamBytes, m_ringBufferCapacityMB * 1024.0f * 1024.0f);
-            m_simulatedBytesDelivered = std::min(m_simulatedBytesDelivered, maxAllowedBytes);
+            m_simulatedBytesDelivered = std::min(m_totalStreamBytes, m_simulatedBytesDelivered + bytesTransferred);
         }
 
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
 
         size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
-        size_t targetCount = (m_streamRefinementProgress >= 0.999f)
+
+        // 1. Total points received across network stream so far
+        size_t streamHead = (m_streamRefinementProgress >= 0.999f)
             ? m_fullStreamingSurfels.size()
             : (size_t)(m_simulatedBytesDelivered / bytesPerSurfel);
+        streamHead = std::max((size_t)64, std::min(m_fullStreamingSurfels.size(), streamHead));
 
-        targetCount = std::max((size_t)64, std::min(m_fullStreamingSurfels.size(), targetCount));
+        // 2. Physical GPU Ring Buffer capacity in points
+        size_t ringBufferMaxPoints = (size_t)((m_ringBufferCapacityMB * 1024.0f * 1024.0f) / bytesPerSurfel);
+        ringBufferMaxPoints = std::max((size_t)64, ringBufferMaxPoints);
 
-        if (targetCount != m_rendererRawSurfels.size())
+        // 3. FIFO Slot Eviction: When streamHead exceeds ring buffer capacity, evict earliest slots
+        size_t streamStart = 0;
+        if (streamHead > ringBufferMaxPoints)
         {
-            m_rendererRawSurfels.assign(m_fullStreamingSurfels.begin(), m_fullStreamingSurfels.begin() + targetCount);
+            streamStart = streamHead - ringBufferMaxPoints;
+            m_evictedSurfelCount = streamStart;
+        }
+        else
+        {
+            m_evictedSurfelCount = 0;
+        }
+
+        size_t activeCount = streamHead - streamStart;
+
+        static size_t lastHead = 0;
+        static size_t lastStart = 0;
+        if (streamHead != lastHead || streamStart != lastStart)
+        {
+            lastHead = streamHead;
+            lastStart = streamStart;
+
+            m_rendererRawSurfels.assign(m_fullStreamingSurfels.begin() + streamStart, m_fullStreamingSurfels.begin() + streamHead);
             SpatialOctree::PartitionIntoMeshletChunks(m_rendererRawSurfels, m_rendererMeshletChunks, 64, m_enableMortonOrder);
             m_rendererSurfels = Quantizer::QuantizeSurfels(m_rendererRawSurfels, m_aabbMin, m_aabbMax);
 
@@ -1742,11 +1762,10 @@ namespace Surfels
                         float deliveredMB = m_simulatedBytesDelivered / (1024.0f * 1024.0f);
                         float totalMB = m_totalStreamBytes / (1024.0f * 1024.0f);
                         char progressOverlay[128];
-                        bool isBufferCapped = (m_ringBufferCapacityMB * 1024.0f * 1024.0f < m_totalStreamBytes && m_simulatedBytesDelivered >= m_ringBufferCapacityMB * 1024.0f * 1024.0f);
-                        if (isBufferCapped)
+                        if (m_evictedSurfelCount > 0)
                         {
-                            snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%% - VRAM Buffer Full) | %u pts",
-                                deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount);
+                            snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%%) | %u in RingBuffer (%zu Evicted)",
+                                deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount, m_evictedSurfelCount);
                         }
                         else
                         {

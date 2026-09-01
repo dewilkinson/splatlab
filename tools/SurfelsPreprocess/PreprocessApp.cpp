@@ -961,7 +961,8 @@ namespace Surfels
 
     void PreprocessApp::InitStreamingSimulation()
     {
-        m_allStreamChunks.clear();
+        m_lodStreamChunks.clear();
+        m_allStreamChunkPtrs.clear();
         m_lodTotalSurfels.clear();
         m_lodResidentSurfels.clear();
 
@@ -970,72 +971,30 @@ namespace Surfels
             PrecacheResidentLODs();
         }
 
-        if (m_enableWavelet && !m_waveletResult.lodLevels.empty())
+        int numLODs = (int)m_residentLODs.size();
+        if (numLODs == 0) return;
+
+        m_lodStreamChunks.resize(numLODs);
+        m_lodTotalSurfels.assign(numLODs, 0);
+        m_lodResidentSurfels.assign(numLODs, 0);
+
+        m_totalStreamBytes = 0.0f;
+
+        // Build hierarchical pre-quantized stream chunks
+        // Level priority order: Coarsest Base level (numLODs - 1) down to Finest Detail level (0)
+        for (int lvl = numLODs - 1; lvl >= 0; lvl--)
         {
-            int numLODs = (int)m_waveletResult.lodLevels.size();
-            m_lodTotalSurfels.assign(numLODs, 0);
-            m_lodResidentSurfels.assign(numLODs, 0);
+            const auto& lodData = m_residentLODs[lvl];
+            const auto& rawPoints = lodData.rawSurfels;
+            const auto& packedPoints = lodData.packedSurfels;
 
-            // Build hierarchical stream chunks
-            // Order: Coarsest Base level (numLODs - 1) down to Finest Detail level (0)
-            for (int lvl = numLODs - 1; lvl >= 0; lvl--)
-            {
-                const auto& levelSurfels = m_waveletResult.lodLevels[lvl].surfels;
-                m_lodTotalSurfels[lvl] = levelSurfels.size();
+            size_t numPoints = rawPoints.size();
+            m_lodTotalSurfels[lvl] = numPoints;
 
-                if (levelSurfels.empty()) continue;
+            if (numPoints == 0) continue;
 
-                size_t numPoints = levelSurfels.size();
-                size_t numChunks = (numPoints + 63) / 64;
-
-                for (size_t c = 0; c < numChunks; c++)
-                {
-                    size_t start = c * 64;
-                    size_t count = std::min((size_t)64, numPoints - start);
-
-                    StreamChunk sc;
-                    sc.lodLevel = lvl;
-                    sc.surfels.assign(levelSurfels.begin() + start, levelSurfels.begin() + start + count);
-                    sc.byteSize = sc.surfels.size() * (m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex));
-                    sc.isResident = false;
-                    sc.currentPriority = 0.0f;
-
-                    // Compute chunk bounding sphere
-                    XMFLOAT3 center = { 0, 0, 0 };
-                    for (const auto& s : sc.surfels)
-                    {
-                        center.x += s.position.x;
-                        center.y += s.position.y;
-                        center.z += s.position.z;
-                    }
-                    center.x /= (float)sc.surfels.size();
-                    center.y /= (float)sc.surfels.size();
-                    center.z /= (float)sc.surfels.size();
-
-                    float radius = 0.0f;
-                    for (const auto& s : sc.surfels)
-                    {
-                        float dx = s.position.x - center.x;
-                        float dy = s.position.y - center.y;
-                        float dz = s.position.z - center.z;
-                        radius = std::max(radius, sqrtf(dx * dx + dy * dy + dz * dz));
-                    }
-
-                    sc.center = center;
-                    sc.radius = radius;
-                    m_allStreamChunks.push_back(std::move(sc));
-                }
-            }
-        }
-        else
-        {
-            // Single LOD fallback
-            const auto& fallbackSurfels = !m_rawSurfels.empty() ? m_rawSurfels : m_rendererRawSurfels;
-            m_lodTotalSurfels.assign(1, fallbackSurfels.size());
-            m_lodResidentSurfels.assign(1, 0);
-
-            size_t numPoints = fallbackSurfels.size();
             size_t numChunks = (numPoints + 63) / 64;
+            m_lodStreamChunks[lvl].reserve(numChunks);
 
             for (size_t c = 0; c < numChunks; c++)
             {
@@ -1043,25 +1002,30 @@ namespace Surfels
                 size_t count = std::min((size_t)64, numPoints - start);
 
                 StreamChunk sc;
-                sc.lodLevel = 0;
-                sc.surfels.assign(fallbackSurfels.begin() + start, fallbackSurfels.begin() + start + count);
-                sc.byteSize = sc.surfels.size() * (m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex));
+                sc.lodLevel = lvl;
+                sc.rawSurfels.assign(rawPoints.begin() + start, rawPoints.begin() + start + count);
+                if (packedPoints.size() >= start + count)
+                {
+                    sc.packedSurfels.assign(packedPoints.begin() + start, packedPoints.begin() + start + count);
+                }
+                sc.byteSize = count * (m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex));
                 sc.isResident = false;
                 sc.currentPriority = 0.0f;
 
+                // Compute bounding sphere
                 XMFLOAT3 center = { 0, 0, 0 };
-                for (const auto& s : sc.surfels)
+                for (const auto& s : sc.rawSurfels)
                 {
                     center.x += s.position.x;
                     center.y += s.position.y;
                     center.z += s.position.z;
                 }
-                center.x /= (float)sc.surfels.size();
-                center.y /= (float)sc.surfels.size();
-                center.z /= (float)sc.surfels.size();
+                center.x /= (float)count;
+                center.y /= (float)count;
+                center.z /= (float)count;
 
                 float radius = 0.0f;
-                for (const auto& s : sc.surfels)
+                for (const auto& s : sc.rawSurfels)
                 {
                     float dx = s.position.x - center.x;
                     float dy = s.position.y - center.y;
@@ -1071,14 +1035,15 @@ namespace Surfels
 
                 sc.center = center;
                 sc.radius = radius;
-                m_allStreamChunks.push_back(std::move(sc));
-            }
-        }
 
-        m_totalStreamBytes = 0.0f;
-        for (const auto& sc : m_allStreamChunks)
-        {
-            m_totalStreamBytes += (float)sc.byteSize;
+                m_totalStreamBytes += (float)sc.byteSize;
+                m_lodStreamChunks[lvl].push_back(std::move(sc));
+            }
+
+            for (auto& chunk : m_lodStreamChunks[lvl])
+            {
+                m_allStreamChunkPtrs.push_back(&chunk);
+            }
         }
 
         float requiredMB = std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f));
@@ -1086,6 +1051,12 @@ namespace Surfels
         {
             m_ringBufferCapacityMB = std::max(64.0f, requiredMB * 1.25f);
         }
+
+        m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
+        m_lastStreamYaw = 1e9f;
+        m_lastStreamPitch = 1e9f;
+        m_priorityUpdateTimer = 0.0f;
+        m_streamStateDirty = true;
 
         ResetStreamingSimulation();
     }
@@ -1096,38 +1067,52 @@ namespace Surfels
         m_streamRefinementProgress = 0.0f;
         m_evictedSurfelCount = 0;
 
-        for (auto& sc : m_allStreamChunks)
+        for (auto* sc : m_allStreamChunkPtrs)
         {
-            sc.isResident = false;
+            if (sc) sc->isResident = false;
         }
 
         std::fill(m_lodResidentSurfels.begin(), m_lodResidentSurfels.end(), 0);
+
+        m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
+        m_lastStreamYaw = 1e9f;
+        m_lastStreamPitch = 1e9f;
+        m_priorityUpdateTimer = 0.0f;
+        m_streamStateDirty = true;
 
         UpdateStreamingSimulation(0.0);
     }
 
     void PreprocessApp::UpdateStreamingSimulation(double dtSeconds)
     {
-        if (!m_enableStreamingSimulation || m_allStreamChunks.empty())
+        if (!m_enableStreamingSimulation || m_allStreamChunkPtrs.empty())
             return;
 
         if (!m_isStreamingPaused)
         {
             if (m_unthrottledBandwidth)
             {
-                m_simulatedBytesDelivered = m_totalStreamBytes;
+                if (m_simulatedBytesDelivered < m_totalStreamBytes)
+                {
+                    m_simulatedBytesDelivered = m_totalStreamBytes;
+                    m_streamStateDirty = true;
+                }
             }
             else
             {
                 float bandwidthBytesPerSec = m_bandwidthThrottleMBps * 1024.0f * 1024.0f;
                 float bytesTransferred = (float)(dtSeconds * bandwidthBytesPerSec);
-                m_simulatedBytesDelivered = std::min(m_totalStreamBytes, m_simulatedBytesDelivered + bytesTransferred);
+                if (bytesTransferred > 0.0f && m_simulatedBytesDelivered < m_totalStreamBytes)
+                {
+                    m_simulatedBytesDelivered = std::min(m_totalStreamBytes, m_simulatedBytesDelivered + bytesTransferred);
+                    m_streamStateDirty = true;
+                }
             }
         }
 
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
 
-        // 1. Extract Camera Position and 6 Frustum Planes
+        // 1. Calculate Camera Position
         const float cy = cosf(m_pitch), sy = sinf(m_pitch);
         const float sx = sinf(m_yaw), cx = cosf(m_yaw);
         XMFLOAT3 eyePos(
@@ -1135,94 +1120,113 @@ namespace Surfels
             m_target.y + m_distance * sy,
             m_target.z + m_distance * cy * cx
         );
-        XMVECTOR eye = XMLoadFloat3(&eyePos);
-        XMVECTOR at = XMLoadFloat3(&m_target);
-        XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-        XMMATRIX view = XMMatrixLookAtRH(eye, at, worldUp);
-        XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, (float)m_Width / (float)std::max(1, (int)m_Height), 0.1f, 500.0f);
-        XMMATRIX viewProj = XMMatrixMultiply(view, proj);
 
-        XMFLOAT4X4 vp;
-        XMStoreFloat4x4(&vp, viewProj);
-        struct Plane4 { float a, b, c, d; } planes[6];
-        planes[0] = { vp._14 + vp._11, vp._24 + vp._21, vp._34 + vp._31, vp._44 + vp._41 };
-        planes[1] = { vp._14 - vp._11, vp._24 - vp._21, vp._34 - vp._31, vp._44 - vp._41 };
-        planes[2] = { vp._14 + vp._12, vp._24 + vp._22, vp._34 + vp._32, vp._44 + vp._42 };
-        planes[3] = { vp._14 - vp._12, vp._24 - vp._22, vp._34 - vp._32, vp._44 - vp._42 };
-        planes[4] = { vp._13, vp._23, vp._33, vp._43 };
-        planes[5] = { vp._14 - vp._13, vp._24 - vp._23, vp._34 - vp._33, vp._44 - vp._43 };
+        // Check if camera moved significantly or update interval (20Hz = 0.05s) elapsed
+        m_priorityUpdateTimer += (float)dtSeconds;
+        float dxCam = eyePos.x - m_lastStreamCamPos.x;
+        float dyCam = eyePos.y - m_lastStreamCamPos.y;
+        float dzCam = eyePos.z - m_lastStreamCamPos.z;
+        float camDistSq = dxCam * dxCam + dyCam * dyCam + dzCam * dzCam;
+        float dYaw = fabsf(m_yaw - m_lastStreamYaw);
+        float dPitch = fabsf(m_pitch - m_lastStreamPitch);
 
-        for (int i = 0; i < 6; i++)
+        bool cameraMoved = (camDistSq > 0.001f || dYaw > 0.005f || dPitch > 0.005f);
+
+        if (cameraMoved && m_priorityUpdateTimer >= 0.04f)
         {
-            float len = sqrtf(planes[i].a * planes[i].a + planes[i].b * planes[i].b + planes[i].c * planes[i].c);
-            if (len > 1e-6f)
-            {
-                float invL = 1.0f / len;
-                planes[i].a *= invL;
-                planes[i].b *= invL;
-                planes[i].c *= invL;
-                planes[i].d *= invL;
-            }
-        }
+            m_priorityUpdateTimer = 0.0f;
+            m_lastStreamCamPos = eyePos;
+            m_lastStreamYaw = m_yaw;
+            m_lastStreamPitch = m_pitch;
 
-        auto IsSphereInFrustum = [&](const XMFLOAT3& center, float radius) -> bool
-        {
+            // Extract 6 Frustum Planes
+            XMVECTOR eye = XMLoadFloat3(&eyePos);
+            XMVECTOR at = XMLoadFloat3(&m_target);
+            XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+            XMMATRIX view = XMMatrixLookAtRH(eye, at, worldUp);
+            XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, (float)m_Width / (float)std::max(1, (int)m_Height), 0.1f, 500.0f);
+            XMMATRIX viewProj = XMMatrixMultiply(view, proj);
+
+            XMFLOAT4X4 vp;
+            XMStoreFloat4x4(&vp, viewProj);
+            struct Plane4 { float a, b, c, d; } planes[6];
+            planes[0] = { vp._14 + vp._11, vp._24 + vp._21, vp._34 + vp._31, vp._44 + vp._41 };
+            planes[1] = { vp._14 - vp._11, vp._24 - vp._21, vp._34 - vp._31, vp._44 - vp._41 };
+            planes[2] = { vp._14 + vp._12, vp._24 + vp._22, vp._34 + vp._32, vp._44 + vp._42 };
+            planes[3] = { vp._14 - vp._12, vp._24 - vp._22, vp._34 - vp._32, vp._44 - vp._42 };
+            planes[4] = { vp._13, vp._23, vp._33, vp._43 };
+            planes[5] = { vp._14 - vp._13, vp._24 - vp._23, vp._34 - vp._33, vp._44 - vp._43 };
+
             for (int i = 0; i < 6; i++)
             {
-                if (planes[i].a * center.x + planes[i].b * center.y + planes[i].c * center.z + planes[i].d < -radius)
-                    return false;
+                float len = sqrtf(planes[i].a * planes[i].a + planes[i].b * planes[i].b + planes[i].c * planes[i].c);
+                if (len > 1e-6f)
+                {
+                    float invL = 1.0f / len;
+                    planes[i].a *= invL; planes[i].b *= invL; planes[i].c *= invL; planes[i].d *= invL;
+                }
             }
-            return true;
-        };
 
-        // 2. Score and sort all chunks by Level Priority + Frustum & Proximity Priority
-        std::vector<size_t> chunkOrder(m_allStreamChunks.size());
-        for (size_t i = 0; i < chunkOrder.size(); i++) chunkOrder[i] = i;
-
-        for (size_t i = 0; i < m_allStreamChunks.size(); i++)
-        {
-            auto& chunk = m_allStreamChunks[i];
-            // Coarse base levels (higher lodLevel index) always stream first
-            float levelWeight = (float)chunk.lodLevel * 1000000.0f;
-
-            if (m_prioritizeFrustumAndProximity)
+            auto IsSphereInFrustum = [&](const XMFLOAT3& center, float radius) -> bool
             {
-                float dx = chunk.center.x - eyePos.x;
-                float dy = chunk.center.y - eyePos.y;
-                float dz = chunk.center.z - eyePos.z;
-                float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-                bool inFrustum = IsSphereInFrustum(chunk.center, chunk.radius);
+                for (int i = 0; i < 6; i++)
+                {
+                    if (planes[i].a * center.x + planes[i].b * center.y + planes[i].c * center.z + planes[i].d < -radius)
+                        return false;
+                }
+                return true;
+            };
 
-                // In-frustum bonus + close proximity bonus
-                float frustumBonus = inFrustum ? 500000.0f : 0.0f;
-                float proximityScore = -dist * 10.0f;
-
-                chunk.currentPriority = levelWeight + frustumBonus + proximityScore;
-            }
-            else
+            // Score each chunk
+            for (auto* pChunk : m_allStreamChunkPtrs)
             {
-                chunk.currentPriority = levelWeight;
+                float levelWeight = (float)pChunk->lodLevel * 1000000.0f;
+                if (m_prioritizeFrustumAndProximity)
+                {
+                    float dx = pChunk->center.x - eyePos.x;
+                    float dy = pChunk->center.y - eyePos.y;
+                    float dz = pChunk->center.z - eyePos.z;
+                    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                    bool inFrustum = IsSphereInFrustum(pChunk->center, pChunk->radius);
+
+                    float frustumBonus = inFrustum ? 500000.0f : 0.0f;
+                    float proximityScore = -dist * 10.0f;
+                    pChunk->currentPriority = levelWeight + frustumBonus + proximityScore;
+                }
+                else
+                {
+                    pChunk->currentPriority = levelWeight;
+                }
             }
+
+            std::sort(m_allStreamChunkPtrs.begin(), m_allStreamChunkPtrs.end(),
+                [](const StreamChunk* a, const StreamChunk* b) {
+                    return a->currentPriority > b->currentPriority;
+                });
+
+            m_streamStateDirty = true;
         }
 
-        std::sort(chunkOrder.begin(), chunkOrder.end(), [&](size_t a, size_t b) {
-            return m_allStreamChunks[a].currentPriority > m_allStreamChunks[b].currentPriority;
-        });
+        if (!m_streamStateDirty)
+            return;
 
-        // 3. Deliver stream packets within bandwidth budget & GPU Ring Buffer limits
+        // 3. Assemble resident buffers with pre-quantized chunks
         float maxResidentBytes = m_ringBufferCapacityMB * 1024.0f * 1024.0f;
         float deliveredBytesAccum = 0.0f;
         float residentBytesAccum = 0.0f;
 
         std::fill(m_lodResidentSurfels.begin(), m_lodResidentSurfels.end(), 0);
-        std::vector<SurfelVertex> newResidentSurfels;
+
+        m_rendererRawSurfels.clear();
+        m_rendererSurfels.clear();
+        m_rendererMeshletChunks.clear();
 
         size_t evictedCount = 0;
+        uint32_t pointOffset = 0;
 
-        for (size_t idx : chunkOrder)
+        for (auto* pChunk : m_allStreamChunkPtrs)
         {
-            auto& chunk = m_allStreamChunks[idx];
-            float chunkBytes = (float)chunk.byteSize;
+            float chunkBytes = (float)pChunk->byteSize;
 
             if (deliveredBytesAccum + chunkBytes <= m_simulatedBytesDelivered || m_unthrottledBandwidth)
             {
@@ -1231,47 +1235,55 @@ namespace Surfels
                 if (residentBytesAccum + chunkBytes <= maxResidentBytes)
                 {
                     residentBytesAccum += chunkBytes;
-                    chunk.isResident = true;
-                    if (chunk.lodLevel >= 0 && chunk.lodLevel < (int)m_lodResidentSurfels.size())
+                    pChunk->isResident = true;
+
+                    if (pChunk->lodLevel >= 0 && pChunk->lodLevel < (int)m_lodResidentSurfels.size())
                     {
-                        m_lodResidentSurfels[chunk.lodLevel] += chunk.surfels.size();
+                        m_lodResidentSurfels[pChunk->lodLevel] += pChunk->rawSurfels.size();
                     }
-                    newResidentSurfels.insert(newResidentSurfels.end(), chunk.surfels.begin(), chunk.surfels.end());
+
+                    uint32_t count = (uint32_t)pChunk->rawSurfels.size();
+
+                    // Direct copy of pre-computed raw and quantized vertices (ZERO CPU quantization!)
+                    m_rendererRawSurfels.insert(m_rendererRawSurfels.end(), pChunk->rawSurfels.begin(), pChunk->rawSurfels.end());
+                    if (!pChunk->packedSurfels.empty())
+                    {
+                        m_rendererSurfels.insert(m_rendererSurfels.end(), pChunk->packedSurfels.begin(), pChunk->packedSurfels.end());
+                    }
+
+                    // Direct construct of MeshletChunkGPU (ZERO CPU octree partitioning!)
+                    MeshletChunkGPU chunkGpu = {};
+                    chunkGpu.center = pChunk->center;
+                    chunkGpu.boundingRadius = pChunk->radius;
+                    chunkGpu.aabbMin = XMFLOAT3(pChunk->center.x - pChunk->radius, pChunk->center.y - pChunk->radius, pChunk->center.z - pChunk->radius);
+                    chunkGpu.aabbExtents = XMFLOAT3(pChunk->radius * 2.0f, pChunk->radius * 2.0f, pChunk->radius * 2.0f);
+                    chunkGpu.surfelOffset = pointOffset;
+                    chunkGpu.surfelCount = count;
+                    m_rendererMeshletChunks.push_back(chunkGpu);
+
+                    pointOffset += count;
                 }
                 else
                 {
-                    // Evicted from ring buffer due to capacity limit
-                    chunk.isResident = false;
-                    evictedCount += chunk.surfels.size();
+                    pChunk->isResident = false;
+                    evictedCount += pChunk->rawSurfels.size();
                 }
             }
             else
             {
-                chunk.isResident = false;
+                pChunk->isResident = false;
             }
         }
 
         m_evictedSurfelCount = evictedCount;
 
-        if (newResidentSurfels.empty() && !m_allStreamChunks.empty())
-        {
-            const auto& firstChunk = m_allStreamChunks[chunkOrder[0]];
-            newResidentSurfels = firstChunk.surfels;
-            if (firstChunk.lodLevel >= 0 && firstChunk.lodLevel < (int)m_lodResidentSurfels.size())
-            {
-                m_lodResidentSurfels[firstChunk.lodLevel] = firstChunk.surfels.size();
-            }
-        }
-
-        m_rendererRawSurfels = std::move(newResidentSurfels);
-        SpatialOctree::PartitionIntoMeshletChunks(m_rendererRawSurfels, m_rendererMeshletChunks, 64, m_enableMortonOrder);
-        m_rendererSurfels = Quantizer::QuantizeSurfels(m_rendererRawSurfels, m_aabbMin, m_aabbMax);
-
-        m_state.surfelCount = (uint32_t)m_rendererSurfels.size();
+        m_state.surfelCount = (uint32_t)(m_enableQuantization ? m_rendererSurfels.size() : m_rendererRawSurfels.size());
         m_state.chunkCount = (uint32_t)m_rendererMeshletChunks.size();
         m_state.pSurfels = m_rendererSurfels.data();
         m_state.pRawSurfels = m_rendererRawSurfels.data();
         m_state.pChunks = m_rendererMeshletChunks.data();
+
+        m_streamStateDirty = false;
     }
 
     void PreprocessApp::ProcessAndExport(const std::string& outputPath)
@@ -1955,8 +1967,8 @@ namespace Surfels
                         }
                         else
                         {
-                            snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%%) | %u / %zu pts",
-                                deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount, m_fullStreamingSurfels.size());
+                            snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%%) | %u resident pts",
+                                deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount);
                         }
                         ImGui::ProgressBar(m_streamRefinementProgress, ImVec2(-1, 20), progressOverlay);
 
@@ -2334,13 +2346,13 @@ namespace Surfels
             PrecacheResidentLODs();
         }
 
-        if (m_residentLODs.empty())
+        int numLODs = (int)m_residentLODs.size();
+        if (numLODs == 0)
         {
             ImGui::TextDisabled("No resident LOD levels available.");
             return;
         }
 
-        int numLODs = (int)m_residentLODs.size();
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         float availWidth = ImGui::GetContentRegionAvailWidth();
 
@@ -2349,16 +2361,6 @@ namespace Surfels
 
         // Base segment count on the top row (Coarsest Base LOD)
         int baseSegments = (numLODs <= 2) ? 8 : 4;
-
-        // Group stream chunks by LOD level
-        std::vector<std::vector<const StreamChunk*>> lodChunkMap(numLODs);
-        for (const auto& sc : m_allStreamChunks)
-        {
-            if (sc.lodLevel >= 0 && sc.lodLevel < numLODs)
-            {
-                lodChunkMap[sc.lodLevel].push_back(&sc);
-            }
-        }
 
         // Display rows: Top row = Highest LOD / Coarsest Base (numLODs - 1), moving down to LOD 0 (Fine)
         for (int rowIdx = 0; rowIdx < numLODs; rowIdx++)
@@ -2373,8 +2375,8 @@ namespace Surfels
             int numSegments = baseSegments * (1 << rowIdx);
             const float barHeight = 14.0f;
 
-            const auto& levelChunks = lodChunkMap[lodIdx];
-            size_t T = levelChunks.size();
+            const auto* pLevelChunks = (lodIdx < (int)m_lodStreamChunks.size()) ? &m_lodStreamChunks[lodIdx] : nullptr;
+            size_t T = pLevelChunks ? pLevelChunks->size() : 0;
 
             // Calculate residency stats
             size_t residentPts = 0;
@@ -2429,13 +2431,13 @@ namespace Surfels
                 {
                     isLit = true;
                 }
-                else if (T > 0)
+                else if (pLevelChunks && T > 0)
                 {
                     size_t idxStart = (size_t)(((float)s / (float)numSegments) * T);
                     size_t idxEnd = std::min(T, std::max(idxStart + 1, (size_t)(((float)(s + 1) / (float)numSegments) * T)));
                     for (size_t c = idxStart; c < idxEnd; c++)
                     {
-                        if (levelChunks[c]->isResident)
+                        if ((*pLevelChunks)[c].isResident)
                         {
                             isLit = true;
                             break;

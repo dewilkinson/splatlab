@@ -963,25 +963,55 @@ namespace Surfels
     {
         m_fullStreamingSurfels.clear();
 
-        if (m_waveletResult.lodLevels.size() > 1)
+        // If a specific LOD level or raw model is active, stream that exact model
+        if (!m_rawSurfels.empty())
         {
-            for (int lvl = (int)m_waveletResult.lodLevels.size() - 1; lvl >= 0; lvl--)
-            {
-                const auto& lod = m_waveletResult.lodLevels[lvl];
-                m_fullStreamingSurfels.insert(m_fullStreamingSurfels.end(), lod.surfels.begin(), lod.surfels.end());
-            }
+            m_fullStreamingSurfels = m_rawSurfels;
         }
-
-        if (m_fullStreamingSurfels.empty())
+        else if (!m_waveletResult.lodLevels.empty())
         {
-            m_fullStreamingSurfels = !m_rendererRawSurfels.empty() ? m_rendererRawSurfels : m_rawSurfels;
+            int lodIdx = std::max(0, std::min((int)m_waveletResult.lodLevels.size() - 1, m_selectedPreviewLOD));
+            m_fullStreamingSurfels = m_waveletResult.lodLevels[lodIdx].surfels;
+        }
+        else
+        {
+            m_fullStreamingSurfels = m_rendererRawSurfels;
         }
 
         if (m_fullStreamingSurfels.empty()) return;
 
+        // If Morton ordering is requested, sort so progressive refinement scans smoothly through 3D space
+        if (m_enableMortonOrder)
+        {
+            float invEx = 1.0f / std::max(0.001f, m_extents.x);
+            float invEy = 1.0f / std::max(0.001f, m_extents.y);
+            float invEz = 1.0f / std::max(0.001f, m_extents.z);
+
+            std::sort(m_fullStreamingSurfels.begin(), m_fullStreamingSurfels.end(),
+                [&](const SurfelVertex& a, const SurfelVertex& b) {
+                    float nax = (a.position.x - m_aabbMin.x) * invEx;
+                    float nay = (a.position.y - m_aabbMin.y) * invEy;
+                    float naz = (a.position.z - m_aabbMin.z) * invEz;
+                    uint32_t ma = SpatialOctree::ComputeMorton30(nax, nay, naz);
+
+                    float nbx = (b.position.x - m_aabbMin.x) * invEx;
+                    float nby = (b.position.y - m_aabbMin.y) * invEy;
+                    float nbz = (b.position.z - m_aabbMin.z) * invEz;
+                    uint32_t mb = SpatialOctree::ComputeMorton30(nbx, nby, nbz);
+
+                    return ma < mb;
+                });
+        }
+
         size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
         m_totalStreamBytes = (float)(m_fullStreamingSurfels.size() * bytesPerSurfel);
-        m_ringBufferCapacityMB = std::max(16.0f, std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f)));
+
+        // Ensure Ring Buffer capacity is large enough to hold the entire model
+        float requiredMB = std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f));
+        if (m_ringBufferCapacityMB < requiredMB)
+        {
+            m_ringBufferCapacityMB = std::max(64.0f, requiredMB * 1.25f);
+        }
 
         ResetStreamingSimulation();
     }
@@ -1020,7 +1050,10 @@ namespace Surfels
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
 
         size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
-        size_t targetCount = (size_t)(m_simulatedBytesDelivered / bytesPerSurfel);
+        size_t targetCount = (m_streamRefinementProgress >= 0.999f)
+            ? m_fullStreamingSurfels.size()
+            : (size_t)(m_simulatedBytesDelivered / bytesPerSurfel);
+
         targetCount = std::max((size_t)64, std::min(m_fullStreamingSurfels.size(), targetCount));
 
         if (targetCount != m_rendererRawSurfels.size())
@@ -1658,15 +1691,25 @@ namespace Surfels
                         ImGui::SameLine();
                         if (ImGui::Button("5G (60 MB/s)", ImVec2(95, 22))) m_bandwidthThrottleMBps = 60.0f;
 
+                        float maxRingMB = std::max(512.0f, std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f) * 2.0f));
                         ImGui::SliderFloat("Bandwidth Throttle", &m_bandwidthThrottleMBps, 0.2f, 100.0f, "%.1f MB/s");
-                        ImGui::SliderFloat("GPU Ring Buffer Size", &m_ringBufferCapacityMB, 4.0f, 256.0f, "%.0f MB");
+                        ImGui::SliderFloat("GPU Ring Buffer Size", &m_ringBufferCapacityMB, 4.0f, maxRingMB, "%.0f MB");
 
                         // Streaming Progress Bar
                         float deliveredMB = m_simulatedBytesDelivered / (1024.0f * 1024.0f);
                         float totalMB = m_totalStreamBytes / (1024.0f * 1024.0f);
                         char progressOverlay[128];
-                        snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%%) | %u pts",
-                            deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount);
+                        bool isBufferCapped = (m_ringBufferCapacityMB * 1024.0f * 1024.0f < m_totalStreamBytes && m_simulatedBytesDelivered >= m_ringBufferCapacityMB * 1024.0f * 1024.0f);
+                        if (isBufferCapped)
+                        {
+                            snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%% - VRAM Buffer Full) | %u pts",
+                                deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount);
+                        }
+                        else
+                        {
+                            snprintf(progressOverlay, sizeof(progressOverlay), "%.1f / %.1f MB (%.0f%%) | %u / %zu pts",
+                                deliveredMB, totalMB, m_streamRefinementProgress * 100.0f, m_state.surfelCount, m_fullStreamingSurfels.size());
+                        }
                         ImGui::ProgressBar(m_streamRefinementProgress, ImVec2(-1, 20), progressOverlay);
 
                         // Playback Controls

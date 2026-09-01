@@ -1995,15 +1995,8 @@ namespace Surfels
                     }
                 }
 
-                // Section 2: LOD Residency Equalizer (Segmented Blocks Indicator)
-                if (ImGui::CollapsingHeader("2. LOD Residency Equalizer", ImGuiTreeNodeFlags_DefaultOpen))
-                {
-                    DrawLODResidencyEqualizer();
-                    ImGui::Separator();
-                }
-
-                // Section 3: Runtime LOD Settings
-                if (ImGui::CollapsingHeader("3. Runtime LOD & Quality", ImGuiTreeNodeFlags_DefaultOpen))
+                // Section 2: Runtime LOD Settings
+                if (ImGui::CollapsingHeader("2. Runtime LOD & Quality", ImGuiTreeNodeFlags_DefaultOpen))
                 {
                     int maxLODIndex = std::max(0, (int)m_waveletResult.lodLevels.size() - 1);
                     if (maxLODIndex > 0)
@@ -2048,8 +2041,8 @@ namespace Surfels
                     }
                 }
 
-                // Section 4: 3D Viewport & Splat Sizing
-                if (ImGui::CollapsingHeader("4. 3D Viewport & Splat Sizing", ImGuiTreeNodeFlags_DefaultOpen))
+                // Section 3: 3D Viewport & Splat Sizing
+                if (ImGui::CollapsingHeader("3. 3D Viewport & Splat Sizing", ImGuiTreeNodeFlags_DefaultOpen))
                 {
                     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Active Display: %u points", m_state.surfelCount);
 
@@ -2115,8 +2108,8 @@ namespace Surfels
                     }
                 }
 
-                // Section 5: Hardware Accelerators & Pipeline
-                if (ImGui::CollapsingHeader("5. Accelerators & Meshlet Pipeline", ImGuiTreeNodeFlags_DefaultOpen))
+                // Section 4: Hardware Accelerators & Pipeline
+                if (ImGui::CollapsingHeader("4. Accelerators & Meshlet Pipeline", ImGuiTreeNodeFlags_DefaultOpen))
                 {
                     if (ImGui::Checkbox("GPU Radix Sort", &m_gpuRadixSort))
                     {
@@ -2190,6 +2183,12 @@ namespace Surfels
         ImGui::SetNextWindowPos(ImVec2((float)m_Width - 410, 30), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(400, (float)m_Height - 40), ImGuiCond_FirstUseEver);
         ImGui::Begin("Statistics & Compression Analytics", nullptr, ImGuiWindowFlags_NoCollapse);
+
+        // LOD Residency Equalizer
+        if (ImGui::CollapsingHeader("LOD Residency", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            DrawLODResidencyEqualizer();
+        }
 
         // Real-Time Performance & Stage Timings
         if (ImGui::CollapsingHeader("Real-Time Performance & Stage Timings", ImGuiTreeNodeFlags_DefaultOpen))

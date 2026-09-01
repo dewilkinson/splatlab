@@ -931,6 +931,9 @@ namespace Surfels
             PrecacheResidentLODs();
         }
 
+        m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
+        m_streamStateDirty = true;
+
         m_state.aabbMin = m_aabbMin;
         m_state.aabbExtents = m_extents;
 
@@ -1177,26 +1180,52 @@ namespace Surfels
                 return true;
             };
 
+            int numLODs = (int)m_residentLODs.size();
+            int coarsestLOD = std::max(0, numLODs - 1);
+            float maxExtent = std::max(1.0f, std::max(m_extents.x, std::max(m_extents.y, m_extents.z)));
+
             // Score each chunk
             for (auto* pChunk : m_allStreamChunkPtrs)
             {
-                float levelWeight = (float)pChunk->lodLevel * 1000000.0f;
+                float dx = pChunk->center.x - eyePos.x;
+                float dy = pChunk->center.y - eyePos.y;
+                float dz = pChunk->center.z - eyePos.z;
+                float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+                bool inFrustum = IsSphereInFrustum(pChunk->center, pChunk->radius);
+
+                // Determine target LOD for this region/view
+                int targetLOD = m_selectedPreviewLOD;
+                if (m_autoLOD)
+                {
+                    // Distance adaptive target LOD: close to camera = LOD 0, far = coarsest
+                    float normDist = std::max(0.0f, std::min(1.0f, dist / (maxExtent * 2.0f)));
+                    targetLOD = std::max(0, std::min(coarsestLOD, (int)std::round(normDist * (float)coarsestLOD)));
+                }
+
+                // 1. Closeness to target LOD: target LOD gets highest points
+                int lodDelta = std::abs(pChunk->lodLevel - targetLOD);
+                float priority = (float)(numLODs - lodDelta) * 500000.0f;
+
+                // 2. Base Coarse LOD Coverage Bonus: ensure coarse base overview is available
+                if (pChunk->lodLevel == coarsestLOD)
+                {
+                    priority += 300000.0f;
+                }
+
                 if (m_prioritizeFrustumAndProximity)
                 {
-                    float dx = pChunk->center.x - eyePos.x;
-                    float dy = pChunk->center.y - eyePos.y;
-                    float dz = pChunk->center.z - eyePos.z;
-                    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-                    bool inFrustum = IsSphereInFrustum(pChunk->center, pChunk->radius);
+                    // 3. View Frustum Bonus: in-frustum chunks get major priority boost
+                    if (inFrustum)
+                    {
+                        priority += 2000000.0f;
+                    }
 
-                    float frustumBonus = inFrustum ? 500000.0f : 0.0f;
-                    float proximityScore = -dist * 10.0f;
-                    pChunk->currentPriority = levelWeight + frustumBonus + proximityScore;
+                    // 4. Camera Proximity Bonus: closer chunks get streamed earlier
+                    float proxFactor = std::max(0.0f, 1.0f - (dist / (maxExtent * 3.0f)));
+                    priority += proxFactor * 1000000.0f;
                 }
-                else
-                {
-                    pChunk->currentPriority = levelWeight;
-                }
+
+                pChunk->currentPriority = priority;
             }
 
             std::sort(m_allStreamChunkPtrs.begin(), m_allStreamChunkPtrs.end(),

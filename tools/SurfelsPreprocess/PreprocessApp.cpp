@@ -1876,43 +1876,9 @@ namespace Surfels
                 float vZ = toCamZ / toCamDist;
                 float dotNV = currentChunk.avgNormal.x * vX + currentChunk.avgNormal.y * vY + currentChunk.avgNormal.z * vZ;
                 
-                // Grazing angle condition: Front-facing to perpendicular
-                bool isGrazingAngle = (dotNV >= -0.05f && dotNV <= m_silhouetteThreshold);
-
-                // View-plane radial outward condition (eliminates interior vertical crevices in the middle of the mesh)
-                float forwardX = m_target.x - eyePos.x;
-                float forwardY = m_target.y - eyePos.y;
-                float forwardZ = m_target.z - eyePos.z;
-                float fDist = sqrtf(forwardX * forwardX + forwardY * forwardY + forwardZ * forwardZ);
-                float fX = (fDist > 1e-4f) ? (forwardX / fDist) : 0.0f;
-                float fY = (fDist > 1e-4f) ? (forwardY / fDist) : 0.0f;
-                float fZ = (fDist > 1e-4f) ? (forwardZ / fDist) : -1.0f;
-
-                // Center displacement vector in view plane
-                float cx = currentChunk.center.x - m_target.x;
-                float cy = currentChunk.center.y - m_target.y;
-                float cz = currentChunk.center.z - m_target.z;
-                float cDotF = cx * fX + cy * fY + cz * fZ;
-                float cPerpX = cx - cDotF * fX;
-                float cPerpY = cy - cDotF * fY;
-                float cPerpZ = cz - cDotF * fZ;
-                float cPerpLen = sqrtf(cPerpX * cPerpX + cPerpY * cPerpY + cPerpZ * cPerpZ);
-
-                // Normal vector in view plane
-                float nDotF = currentChunk.avgNormal.x * fX + currentChunk.avgNormal.y * fY + currentChunk.avgNormal.z * fZ;
-                float nPerpX = currentChunk.avgNormal.x - nDotF * fX;
-                float nPerpY = currentChunk.avgNormal.y - nDotF * fY;
-                float nPerpZ = currentChunk.avgNormal.z - nDotF * fZ;
-                float nPerpLen = sqrtf(nPerpX * nPerpX + nPerpY * nPerpY + nPerpZ * nPerpZ);
-
-                bool isOutwardRim = true;
-                if (cPerpLen > 1e-3f && nPerpLen > 1e-3f)
-                {
-                    float radialDot = (cPerpX * nPerpX + cPerpY * nPerpY + cPerpZ * nPerpZ) / (cPerpLen * nPerpLen);
-                    isOutwardRim = (radialDot >= 0.40f);
-                }
-
-                isExactGrazing = m_enableSilhouetteLOD0 && isGrazingAngle && isOutwardRim;
+                // Grazing angle condition: surface normal nearly perpendicular to camera view ray
+                bool isGrazingAngle = (fabsf(dotNV) <= m_silhouetteThreshold);
+                isExactGrazing = m_enableSilhouetteLOD0 && isGrazingAngle;
 
                 int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
                 if (lvl <= silTargetLOD)
@@ -4651,12 +4617,39 @@ namespace Surfels
             }
             int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
 
-            // Iterate over all active resident meshlet chunks
-            for (size_t i = 0; i < m_rendererMeshletChunks.size(); i++)
+            const uint32_t activeChunkCount = m_state.chunkCount > 0 ? m_state.chunkCount : (uint32_t)m_rendererMeshletChunks.size();
+            const MeshletChunkGPU* pActiveChunks = m_state.pChunks ? m_state.pChunks : m_rendererMeshletChunks.data();
+
+            for (uint32_t i = 0; i < activeChunkCount && pActiveChunks != nullptr; i++)
             {
-                const auto& chunkGpu = m_rendererMeshletChunks[i];
-                // Must be marked as silhouette chunk at or finer than the silhouette target LOD
-                if (chunkGpu.lodLevel <= (uint32_t)silTargetLOD && chunkGpu.isSilhouette > 0.5f)
+                const auto& chunkGpu = pActiveChunks[i];
+                bool isSil = (chunkGpu.isSilhouette > 0.5f);
+
+                if (!isSil)
+                {
+                    if (i < m_rendererSourceChunks.size() && m_rendererSourceChunks[i])
+                    {
+                        isSil = m_rendererSourceChunks[i]->isSilhouette;
+                    }
+                    
+                    if (!isSil)
+                    {
+                        float toCamX = eyePos.x - chunkGpu.center.x;
+                        float toCamY = eyePos.y - chunkGpu.center.y;
+                        float toCamZ = eyePos.z - chunkGpu.center.z;
+                        float toCamDist = sqrtf(toCamX * toCamX + toCamY * toCamY + toCamZ * toCamZ);
+                        if (toCamDist > 1e-4f)
+                        {
+                            float dotNV = (chunkGpu.coneAxis.x * toCamX + chunkGpu.coneAxis.y * toCamY + chunkGpu.coneAxis.z * toCamZ) / toCamDist;
+                            if (fabsf(dotNV) <= m_silhouetteThreshold)
+                            {
+                                isSil = true;
+                            }
+                        }
+                    }
+                }
+
+                if (isSil)
                 {
                     ImVec2 sp;
                     if (ProjectToScreen(chunkGpu.center, sp))

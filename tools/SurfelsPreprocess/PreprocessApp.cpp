@@ -1122,7 +1122,7 @@ namespace Surfels
                 }
                 sc.aabbMin = aMin;
                 sc.aabbMax = aMax;
-                sc.genesisWaveTimer = 0.0f;
+                sc.streamWaveTimer = 0.0f;
 
                 m_totalStreamBytes += (float)sc.byteSize;
                 m_lodStreamChunks[lvl].push_back(std::move(sc));
@@ -1458,12 +1458,12 @@ namespace Surfels
 
         float maxExtent = std::max(1.0f, std::max(m_extents.x, std::max(m_extents.y, m_extents.z)));
 
-        // 0. Update Star Trek Genesis Device creeping wavefront countdown timers
+        // 0. Update Show Chunk Stream creeping wavefront countdown timers
         for (auto* pChunk : m_allStreamChunkPtrs)
         {
-            if (pChunk && pChunk->genesisWaveTimer > 0.0f)
+            if (pChunk && pChunk->streamWaveTimer > 0.0f)
             {
-                pChunk->genesisWaveTimer = std::max(0.0f, pChunk->genesisWaveTimer - (float)dtSeconds);
+                pChunk->streamWaveTimer = std::max(0.0f, pChunk->streamWaveTimer - (float)dtSeconds);
             }
         }
 
@@ -1707,7 +1707,7 @@ namespace Surfels
                     chunk.isResident = true;
                     chunk.isDelivered = true;
                     chunk.isRequested = false;
-                    chunk.genesisWaveTimer = m_genesisWaveDuration; // Activate Star Trek Genesis Device creeping wave
+                    chunk.streamWaveTimer = m_chunkStreamDuration; // Activate Show Chunk Stream lavender wave
                     m_simulatedBytesDelivered += cBytes;
                     currentResidentBytes += cBytes;
                     budget -= cBytes;
@@ -1778,11 +1778,11 @@ namespace Surfels
             int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
             bool isSilLOD = (pChunk->lodLevel <= silTargetLOD && isSil);
 
-            // Genesis Device Wavefront parameter: 1.0 (Leading shockwave edge) down to 0.0 (Settled permanent surface)
+            // Show Chunk Stream: 1.0 (Leading wave crest) down to 0.0 (Settled permanent surface)
             float waveIntensity = 0.0f;
-            if (m_enableGenesisWave && pChunk->genesisWaveTimer > 0.0f && m_genesisWaveDuration > 0.0f)
+            if (m_showChunkStream && pChunk->streamWaveTimer > 0.0f && m_chunkStreamDuration > 0.0f)
             {
-                waveIntensity = std::min(1.0f, pChunk->genesisWaveTimer / m_genesisWaveDuration);
+                waveIntensity = std::min(1.0f, pChunk->streamWaveTimer / m_chunkStreamDuration);
             }
             else if (isSilLOD)
             {
@@ -3088,15 +3088,15 @@ namespace Surfels
                         }
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Highlights active silhouette edge chunks in lavender.");
 
-                        if (ImGui::Checkbox("Genesis Device Surface Wave (Lavender)", &m_enableGenesisWave))
+                        if (ImGui::Checkbox("Show Chunk Stream (Lavender Wave)", &m_showChunkStream))
                         {
                             m_streamStateDirty = true;
                         }
-                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Simulates a Star Trek Genesis Device creeping surface wave: an advancing glowing lavender wavefront edge followed by a dissipating alpha wake as chunks stream in over the model body.");
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Visualizes newly arrived chunks as a creeping lavender wavefront and dissolving alpha wake as chunks stream in over the model body.");
 
-                        if (m_enableGenesisWave)
+                        if (m_showChunkStream)
                         {
-                            if (ImGui::SliderFloat("Genesis Wave Dissolve", &m_genesisWaveDuration, 0.5f, 6.0f, "%.1fs"))
+                            if (ImGui::SliderFloat("Chunk Stream Fade Time", &m_chunkStreamDuration, 0.5f, 6.0f, "%.1fs"))
                             {
                                 m_streamStateDirty = true;
                             }
@@ -4593,7 +4593,7 @@ namespace Surfels
         BuildUI();
         m_state.time += (float)(m_deltaTime / 1000.0);
         m_state.enableDithering = m_enableDitheredTransitions;
-        m_state.highlightSilhouette = m_highlightSilhouetteChunks || m_enableGenesisWave;
+        m_state.highlightSilhouette = m_highlightSilhouetteChunks || m_showChunkStream;
 
         if (m_deviceLost)
         {

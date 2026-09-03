@@ -1739,16 +1739,52 @@ namespace Surfels
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
 
         // 8. Demand-Driven Traversal: Assemble Active Render Workload & Post Child Demands
-        m_rendererRawSurfels.clear();
-        m_rendererSurfels.clear();
-        m_rendererMeshletChunks.clear();
-
-        uint32_t pointOffset = 0;
         int targetLOD = m_selectedPreviewLOD;
         if (m_autoLOD)
         {
             targetLOD = std::max(0, std::min(numLODs - 1, m_selectedPreviewLOD));
         }
+
+        // Fast In-Place Dirty State Gate: If resident chunks & topology have not changed,
+        // update chunk shaders/timers directly in place without re-copying millions of surfels or re-uploading full VRAM
+        if (!m_streamStateDirty && !m_rendererMeshletChunks.empty() && m_rendererMeshletChunks.size() == m_rendererSourceChunks.size())
+        {
+            int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
+            for (size_t i = 0; i < m_rendererMeshletChunks.size(); i++)
+            {
+                auto* pChunk = m_rendererSourceChunks[i];
+                if (!pChunk) continue;
+
+                bool isSilLOD = (pChunk->lodLevel <= silTargetLOD && pChunk->isSilhouette);
+                float waveIntensity = 0.0f;
+                if (m_showChunkStream && pChunk->streamWaveTimer > 0.0f && m_chunkStreamDuration > 0.0f)
+                {
+                    waveIntensity = std::min(1.0f, pChunk->streamWaveTimer / m_chunkStreamDuration);
+                }
+                else if (isSilLOD)
+                {
+                    waveIntensity = 1.0f;
+                }
+
+                m_rendererMeshletChunks[i].isSilhouette = waveIntensity;
+                m_rendererMeshletChunks[i].dilationMorph = isSilLOD ? m_dilationMorphAmount : 0.0f;
+                m_rendererMeshletChunks[i].blendWeight = pChunk->transitionProgress;
+            }
+
+            m_state.surfelCount = (uint32_t)(m_enableQuantization ? m_rendererSurfels.size() : m_rendererRawSurfels.size());
+            m_state.chunkCount = (uint32_t)m_rendererMeshletChunks.size();
+            m_state.pSurfels = m_rendererSurfels.data();
+            m_state.pRawSurfels = m_rendererRawSurfels.data();
+            m_state.pChunks = m_rendererMeshletChunks.data();
+            return;
+        }
+
+        m_rendererRawSurfels.clear();
+        m_rendererSurfels.clear();
+        m_rendererMeshletChunks.clear();
+        m_rendererSourceChunks.clear();
+
+        uint32_t pointOffset = 0;
 
         // Reset silhouette and transition lock flags across all chunks before traversal
         for (auto& lodList : m_lodStreamChunks)
@@ -1759,9 +1795,6 @@ namespace Surfels
                 c.isLockedInTransition = false;
             }
         }
-
-        std::vector<StreamChunk*> rendererSourceChunks;
-        rendererSourceChunks.reserve(4096);
 
         auto AppendChunkToRenderer = [&](StreamChunk* pChunk, float blendWeight, bool isSil)
         {
@@ -1801,7 +1834,7 @@ namespace Surfels
             chunkGpu.dilationMorph = isSilLOD ? m_dilationMorphAmount : 0.0f;
             chunkGpu.isSilhouette = waveIntensity;
             m_rendererMeshletChunks.push_back(chunkGpu);
-            rendererSourceChunks.push_back(pChunk);
+            m_rendererSourceChunks.push_back(pChunk);
 
             pointOffset += count;
         };
@@ -2149,7 +2182,7 @@ namespace Surfels
                     if (ProjectPos(m_rendererMeshletChunks[i].center, sp))
                     {
                         candidateGpuIndices[candidateCount] = i;
-                        candidateStreamChunks[candidateCount] = (i < rendererSourceChunks.size()) ? rendererSourceChunks[i] : nullptr;
+                        candidateStreamChunks[candidateCount] = (i < m_rendererSourceChunks.size()) ? m_rendererSourceChunks[i] : nullptr;
                         candidateScreenPos[candidateCount] = sp;
                         candidateCount++;
                     }
@@ -2157,9 +2190,9 @@ namespace Surfels
                     {
                         m_rendererMeshletChunks[i].isSilhouette = 0.0f;
                         m_rendererMeshletChunks[i].dilationMorph = 0.0f;
-                        if (i < rendererSourceChunks.size() && rendererSourceChunks[i])
+                        if (i < m_rendererSourceChunks.size() && m_rendererSourceChunks[i])
                         {
-                            rendererSourceChunks[i]->isSilhouette = false;
+                            m_rendererSourceChunks[i]->isSilhouette = false;
                         }
                     }
                 }

@@ -1136,47 +1136,17 @@ namespace Surfels
 
     void PreprocessApp::ResetStreamingSimulation()
     {
-        m_simulatedBytesDelivered = 0.0f;
-        m_streamRefinementProgress = 0.0f;
+        int numLODs = (int)m_lodStreamChunks.size();
+        int coarsestLvl = numLODs > 0 ? (numLODs - 1) : 0;
+        int minProtectedLvl = std::max(0, coarsestLvl - 1);
+
         m_evictedSurfelCount = 0;
-
-        for (auto* sc : m_allStreamChunkPtrs)
-        {
-            if (sc)
-            {
-                sc->isRequested = false;
-                sc->isDelivered = false;
-                sc->isResident = false;
-                sc->isEvictionPending = false;
-                sc->isLockedInTransition = false;
-                sc->transitionProgress = 0.0f;
-            }
-        }
-
-        m_demandRequestQueue.clear();
-        m_demandRequestHead = 0;
-
-        std::fill(m_lodResidentSurfels.begin(), m_lodResidentSurfels.end(), 0);
-
-        m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
-        m_lastStreamYaw = 1e9f;
-        m_lastStreamPitch = 1e9f;
-        m_priorityUpdateTimer = 0.0f;
-        m_streamStateDirty = true;
-
-        UpdateStreamingSimulation(0.0);
-    }
-
-    void PreprocessApp::ClearResidentStream()
-    {
         m_simulatedBytesDelivered = 0.0f;
-        m_streamRefinementProgress = 0.0f;
-        m_evictedSurfelCount = 0;
 
-        // Release all locks (transition locks & silhouette locks) and reset residency across all chunks
-        for (auto& lvl : m_lodStreamChunks)
+        // 1. Reset all finer detail levels (< minProtectedLvl)
+        for (int lvl = 0; lvl < minProtectedLvl; lvl++)
         {
-            for (auto& sc : lvl)
+            for (auto& sc : m_lodStreamChunks[lvl])
             {
                 sc.isRequested = false;
                 sc.isDelivered = false;
@@ -1186,24 +1156,34 @@ namespace Surfels
                 sc.isSilhouette = false;
                 sc.transitionProgress = 0.0f;
             }
+            m_lodResidentSurfels[lvl] = 0;
+            m_smoothedLodResidentPct[lvl] = 0.0f;
+            m_smoothedLodResidentBlocks[lvl] = 0;
+        }
+
+        // 2. Deliver the entirety of max level and max-1 level in 1 go (never streamed in parts)
+        for (int lvl = minProtectedLvl; lvl <= coarsestLvl; lvl++)
+        {
+            for (auto& sc : m_lodStreamChunks[lvl])
+            {
+                sc.isRequested = true;
+                sc.isDelivered = true;
+                sc.isResident = true;
+                sc.isEvictionPending = false;
+                sc.isLockedInTransition = false;
+                sc.isSilhouette = false;
+                sc.transitionProgress = 0.0f;
+                m_simulatedBytesDelivered += (float)sc.byteSize;
+            }
+            m_lodResidentSurfels[lvl] = m_lodTotalSurfels[lvl];
+            m_smoothedLodResidentPct[lvl] = 1.0f;
+            m_smoothedLodResidentBlocks[lvl] = 20;
         }
 
         m_demandRequestQueue.clear();
         m_demandRequestHead = 0;
 
-        std::fill(m_lodResidentSurfels.begin(), m_lodResidentSurfels.end(), 0);
-        std::fill(m_smoothedLodResidentPct.begin(), m_smoothedLodResidentPct.end(), 0.0f);
-        std::fill(m_smoothedLodResidentBlocks.begin(), m_smoothedLodResidentBlocks.end(), 0);
-
-        m_rendererRawSurfels.clear();
-        m_rendererSurfels.clear();
-        m_rendererMeshletChunks.clear();
-
-        m_state.surfelCount = 0;
-        m_state.chunkCount = 0;
-        m_state.pSurfels = nullptr;
-        m_state.pRawSurfels = nullptr;
-        m_state.pChunks = nullptr;
+        m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
 
         m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
         m_lastStreamYaw = 1e9f;
@@ -1211,6 +1191,72 @@ namespace Surfels
         m_priorityUpdateTimer = 0.0f;
         m_equalizerUpdateTimer = 0.0f;
         m_streamStateDirty = true;
+
+        UpdateStreamingSimulation(0.0);
+    }
+
+    void PreprocessApp::ClearResidentStream()
+    {
+        int numLODs = (int)m_lodStreamChunks.size();
+        int coarsestLvl = numLODs > 0 ? (numLODs - 1) : 0;
+        int minProtectedLvl = std::max(0, coarsestLvl - 1);
+
+        m_evictedSurfelCount = 0;
+        m_simulatedBytesDelivered = 0.0f;
+
+        // Evict only finer levels (< minProtectedLvl).
+        // The highest two mip levels (coarsestLvl and coarsestLvl - 1) are NEVER evicted!
+        for (int lvl = 0; lvl < numLODs; lvl++)
+        {
+            if (lvl < minProtectedLvl)
+            {
+                for (auto& sc : m_lodStreamChunks[lvl])
+                {
+                    sc.isRequested = false;
+                    sc.isDelivered = false;
+                    sc.isResident = false;
+                    sc.isEvictionPending = false;
+                    sc.isLockedInTransition = false;
+                    sc.isSilhouette = false;
+                    sc.transitionProgress = 0.0f;
+                }
+                m_lodResidentSurfels[lvl] = 0;
+                m_smoothedLodResidentPct[lvl] = 0.0f;
+                m_smoothedLodResidentBlocks[lvl] = 0;
+            }
+            else
+            {
+                // Top two mip levels remain 100% resident and solid in memory
+                for (auto& sc : m_lodStreamChunks[lvl])
+                {
+                    sc.isRequested = true;
+                    sc.isDelivered = true;
+                    sc.isResident = true;
+                    sc.isEvictionPending = false;
+                    sc.isLockedInTransition = false;
+                    sc.isSilhouette = false;
+                    sc.transitionProgress = 0.0f;
+                    m_simulatedBytesDelivered += (float)sc.byteSize;
+                }
+                m_lodResidentSurfels[lvl] = m_lodTotalSurfels[lvl];
+                m_smoothedLodResidentPct[lvl] = 1.0f;
+                m_smoothedLodResidentBlocks[lvl] = 20;
+            }
+        }
+
+        m_demandRequestQueue.clear();
+        m_demandRequestHead = 0;
+
+        m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
+
+        m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
+        m_lastStreamYaw = 1e9f;
+        m_lastStreamPitch = 1e9f;
+        m_priorityUpdateTimer = 0.0f;
+        m_equalizerUpdateTimer = 0.0f;
+        m_streamStateDirty = true;
+
+        UpdateStreamingSimulation(0.0);
     }
 
     void PreprocessApp::RequestChunk(int lodLevel, size_t chunkIndex, float priority)
@@ -3739,7 +3785,7 @@ namespace Surfels
         }
         if (ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("Immediately evicts all resident stream chunks and resets streaming delivery.");
+            ImGui::SetTooltip("Evicts refined detail stream chunks (LOD 0..max-2) while keeping the top two base mip levels (max & max-1) permanently resident.");
         }
 
         ImGui::SameLine();

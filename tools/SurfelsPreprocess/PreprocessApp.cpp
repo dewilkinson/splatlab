@@ -1691,27 +1691,18 @@ namespace Surfels
                     // Never evict chunks that are currently locked in transition, base level, or already pending eviction
                     if (chunk.isResident && !chunk.isLockedInTransition && !chunk.isEvictionPending)
                     {
-                        // When silhouette mode is enabled: identified silhouette chunks remain locked while inside the viewport!
-                        if (m_enableSilhouetteLOD0 && IsSphereInFrustum(chunk.center, chunk.radius))
+                        // When silhouette mode is enabled: identified silhouette chunks remain locked while inside the
+                        // viewport. This must check the chunk's actual GPU-detected isSilhouette flag -- it previously
+                        // also ran an independent grazing-angle heuristic (dotNV vs. an effectiveThresh that could
+                        // reach 0.90) that had nothing to do with whether the chunk was an actual detected edge.
+                        // |dotNV| <= 0.90 covers the whole surface except a narrow ~26-degree cone directly facing
+                        // the camera, so on any rounded/complex model that locked the vast majority of visible,
+                        // ordinary (non-edge) geometry against decay -- only the narrow near-camera-facing sliver
+                        // was ever actually eligible to drain, which is exactly why decay would stall with most of
+                        // levels 0/1/2 never even starting to evict.
+                        if (m_enableSilhouetteLOD0 && chunk.isSilhouette && IsSphereInFrustum(chunk.center, chunk.radius))
                         {
-                            if (chunk.lodLevel == 0 && chunk.isSilhouette)
-                            {
-                                continue; // Pinned Level 0 silhouette chunk inside viewport is strictly locked!
-                            }
-                            float toCamX = eyePos.x - chunk.center.x;
-                            float toCamY = eyePos.y - chunk.center.y;
-                            float toCamZ = eyePos.z - chunk.center.z;
-                            float toCamDist = sqrtf(toCamX * toCamX + toCamY * toCamY + toCamZ * toCamZ);
-                            if (toCamDist > 1e-4f)
-                            {
-                                float dotNV = chunk.avgNormal.x * (toCamX / toCamDist) + chunk.avgNormal.y * (toCamY / toCamDist) + chunk.avgNormal.z * (toCamZ / toCamDist);
-                                float coneAllowance = (chunk.lodLevel > 0) ? sqrtf(std::max(0.0f, chunk.normalSpread * (2.0f - chunk.normalSpread))) : 0.0f;
-                                float effectiveThresh = std::max(m_silhouetteThreshold, std::min(0.90f, m_silhouetteThreshold + coneAllowance * 0.75f));
-                                if (fabsf(dotNV) <= effectiveThresh)
-                                {
-                                    continue; // Silhouette branch inside viewport is locked against eviction!
-                                }
-                            }
+                            continue; // Identified silhouette chunk inside viewport is locked against eviction!
                         }
 
                         chunk.isEvictionPending = true; // Initiate graceful eviction handshake
@@ -1819,7 +1810,16 @@ namespace Surfels
         }
 
         // 4. Greedy Mode Background Queueing: if greedy mode enabled and foreground queue is light
-        if (m_streamingPolicy == StreamingPolicy::Greedy && (m_demandRequestQueue.size() - m_demandRequestHead) < 32)
+        // Suppressed while decay is active: this loop re-requests every non-resident chunk across the
+        // WHOLE hierarchy the moment it's evicted (its own !isResident && !isRequested && !isEvictionPending
+        // check matches a freshly-decayed chunk exactly), and with any real bandwidth budget the delivery
+        // simulator below hands it straight back a frame or two later. Decay is an explicit, deliberate
+        // request to drain the cache; it should not have to fight Greedy's opportunistic prefetch-ahead
+        // for the same chunks; that fight is exactly why most of the model stayed resident even at max
+        // decay with an effectively unthrottled bandwidth budget. On-demand requests driven by what's
+        // actually needed for the current view (TraverseNode's own RequestChunk calls) are untouched --
+        // only this background/ahead-of-need prefetching is paused.
+        if (m_streamingPolicy == StreamingPolicy::Greedy && !m_enableStreamDecay && (m_demandRequestQueue.size() - m_demandRequestHead) < 32)
         {
             size_t bgQueued = 0;
             for (int lvl = coarsestLvl; lvl >= 0 && bgQueued < 32; lvl--)
@@ -1835,15 +1835,24 @@ namespace Surfels
             }
         }
 
-        // 5. Update Priorities & Sort Demand Requests (throttled to 5 Hz, capped to 256 items)
-        m_priorityUpdateTimer += (float)dtSeconds;
-        if (m_priorityUpdateTimer >= 0.20f)
+        // 5. Update Priorities & Sort Demand Requests (every frame)
+        // RequestChunk() already caps the pending queue at 1024 entries, so re-sorting the full pending
+        // range here is cheap (well under a millisecond) -- there is no need to additionally truncate to
+        // a small head window, and no need to throttle the sort itself to 5 Hz. It used to be both: capped
+        // to a 256-item head window AND only refreshed every 0.2s. Section 6 below (Bandwidth Delivery
+        // Simulator) drains from the head every single frame, and RequestChunk() appends newly-discovered
+        // requests (e.g. freshly GPU-detected silhouette edges) in raw traversal order as it finds them --
+        // also every frame. With any reasonable bandwidth budget, delivery could drain straight through
+        // everything appended since the last 5 Hz sort before that sort ever ran again, so what actually
+        // got delivered was effectively whatever raw traversal order requests happened to be posted in
+        // That's what made a mass re-request (e.g. "Clear", or a newly-detected batch of edge chunks after
+        // "Test Edge Refinement") fill like a sequential per-level/macro-block sweep instead of the
+        // window entirely.
         {
-            m_priorityUpdateTimer = 0.0f;
             size_t pendingCount = (m_demandRequestQueue.size() > m_demandRequestHead) ? (m_demandRequestQueue.size() - m_demandRequestHead) : 0;
             if (pendingCount > 0)
             {
-                size_t sortCount = std::min(pendingCount, (size_t)256);
+                size_t sortCount = pendingCount;
                 for (size_t i = m_demandRequestHead; i < m_demandRequestHead + sortCount; i++)
                 {
                     auto& req = m_demandRequestQueue[i];
@@ -1934,6 +1943,23 @@ namespace Surfels
 
         // 8. Demand-Driven Traversal: Assemble Active Render Workload & Post Child Demands
         int targetLOD = std::max(0, std::min(numLODs - 1, m_selectedPreviewLOD));
+
+        // While decay is active, pin the traversal's target to the coarsest non-mandatory level so the
+        // WHOLE hierarchy (besides the two permanently-resident coarsest levels) is treated as wanting to
+        // demote/evict -- including whatever level the current camera distance would otherwise consider
+        // "in active use." Without this, section 2's decay pass and TraverseNode's own on-demand
+        // refinement fight over the same chunks: decay marks a currently-needed chunk for eviction, but
+        // the very next frame TraverseNode sees it's not resident, decides it's still wanted at the real
+        // targetLOD, and re-requests it via its normal "if (!currentChunk.isResident) RequestChunk(...)"
+        // path -- independent of and in addition to the Greedy background-prefetch fight fixed above.
+        // That's why most of the model stayed resident even at max decay: only content genuinely unused
+        // by the current view could ever actually drain. This makes decay authoritative: with it on, the
+        // model gracefully falls back to the pinned coarse envelope via the existing cross-fade/eviction
+        // machinery, same as if the camera had moved far enough away to want only those levels.
+        if (m_enableStreamDecay && m_streamDecayRate > 0.0f)
+        {
+            targetLOD = std::max(targetLOD, std::max(0, coarsestLvl - 1));
+        }
 
         // Ingest GPU Silhouette Edge Inversion Bitmask (Option 2) from previous frame's rendered chunks
         if (m_pRenderer && (m_highlightSilhouetteChunks || m_enableSilhouetteLOD0))
@@ -2041,6 +2067,46 @@ namespace Surfels
             m_rendererSourceChunks.push_back(pChunk);
         };
 
+        // Recursively evicts every still-resident descendant of (lvl, cIdx) below it. TraverseNode only
+        // ever visits a chunk's children while recursing through it during its OWN mid-transition window
+        // (transitionProgress between 0 and 1); once a chunk's transition completes and it gets evicted,
+        // the traversal stops descending into it entirely (a non-resident chunk just re-requests itself
+        // and returns). If that chunk still had resident grandchildren -- e.g. because its own demotion
+        // completed in a single instant step (dithering disabled, or the transition-overload valve above
+        // forcing progressStep = 1.0) rather than over several frames of mid-transition recursion -- those
+        // descendants never got a chance to be visited and cascade-evict themselves. They'd be orphaned:
+        // still marked resident, permanently unreachable by the traversal from then on, so they could
+        // never actually drain. This is exactly why finer levels (which sit behind more potential
+        // instantly-evicted ancestors) plateaued while decay was active instead of continuing to 0%.
+        std::function<void(int, size_t)> EvictResidentDescendants = [&](int lvl, size_t cIdx)
+        {
+            int childLvl = lvl - 1;
+            if (childLvl < 0 || childLvl >= numLODs || m_lodStreamChunks[childLvl].empty()) return;
+            size_t curSize = m_lodStreamChunks[lvl].size();
+            size_t childSize = m_lodStreamChunks[childLvl].size();
+            if (curSize == 0 || childSize == 0) return;
+            size_t cStart = std::min((cIdx * childSize) / curSize, childSize);
+            size_t cEnd = std::min(std::max(cStart + 1, ((cIdx + 1) * childSize) / curSize), childSize);
+            for (size_t ci = cStart; ci < cEnd; ci++)
+            {
+                auto& gc = m_lodStreamChunks[childLvl][ci];
+                if (gc.isResident)
+                {
+                    gc.isResident = false;
+                    gc.isDelivered = false;
+                    gc.isRequested = false;
+                    gc.isEvictionPending = false;
+                    gc.isLockedInTransition = false;
+                    gc.transitionProgress = 0.0f;
+                    m_simulatedBytesDelivered = std::max(0.0f, m_simulatedBytesDelivered - (float)gc.byteSize);
+                    m_evictedSurfelCount += gc.rawSurfels.size();
+                }
+                // Recurse regardless of gc's own residency: it may itself have orphaned resident
+                // descendants left over from before this cascade existed.
+                EvictResidentDescendants(childLvl, ci);
+            }
+        };
+
         // Safety valve: if last frame already had a dangerously large number of chunks simultaneously
         // mid cross-fade (e.g. from a big camera-distance/LOD jump touching most of the hierarchy at
         // once), force every in-flight transition to complete instantly this frame instead of animating
@@ -2087,7 +2153,15 @@ namespace Surfels
             currentChunk.isSilhouette = isSilhouette;
 
             int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
-            bool shouldRefineToLOD0 = isSilhouette;
+            // Silhouette-edge refinement is only meaningful for the automatic, camera-distance-driven
+            // LOD selection (m_autoLOD) -- it exists to keep contour edges crisp while the rest of a
+            // receding object coarsens. It must NOT apply when the user has explicitly forced a single
+            // LOD level (manual slider, m_autoLOD == false): which chunks the GPU flags as "silhouette"
+            // is inherently view-dependent (screen-space edge detection against the current camera), so
+            // as the camera orbits, a different, constantly-shifting subset of chunks would keep getting
+            // pulled toward LOD0 and cross-faded back -- visible as distracting flicker across the whole
+            // model while spinning at a forced level, even though nothing should be transitioning at all.
+            bool shouldRefineToLOD0 = isSilhouette && m_autoLOD;
             int nodeTargetLOD = shouldRefineToLOD0 ? silTargetLOD : targetLOD;
 
             // In Conservative mode: skip requesting/refining out-of-frustum chunks beyond the neighbor buffer
@@ -2221,9 +2295,16 @@ namespace Surfels
                     auto& c = m_lodStreamChunks[finerLvl][ci];
                     c.isLockedInTransition = false;
 
-                    // In Conservative mode: evict non-silhouette Level N-1 child chunks upon demotion completion
+                    // In Conservative mode: evict non-silhouette Level N-1 child chunks upon demotion completion.
+                    // In Greedy mode, only evict if THIS chunk was explicitly decay-marked (c.isEvictionPending,
+                    // set by the LRU decay pass above) -- otherwise Greedy's normal "keep it cached, don't
+                    // thrash" behavior is preserved. Without the isEvictionPending clause, decay had no effect
+                    // at all under Greedy (the default streaming policy): it would set isEvictionPending = true,
+                    // this whole block would be skipped every time, and the flag would just stay stuck true
+                    // forever -- resident memory was never actually reclaimed no matter how high the decay
+                    // rate or how low the bandwidth throttle was set.
                     // (Never evict highest two mip levels: coarsestLvl and coarsestLvl - 1)
-                    if (m_streamingPolicy == StreamingPolicy::Conservative && (!c.isSilhouette || anyChildEvictionPending))
+                    if ((m_streamingPolicy == StreamingPolicy::Conservative || c.isEvictionPending) && (!c.isSilhouette || anyChildEvictionPending))
                     {
                         if (finerLvl < coarsestLvl - 1)
                         {
@@ -2238,6 +2319,9 @@ namespace Surfels
                                 m_evictedSurfelCount += c.rawSurfels.size();
                                 m_streamStateDirty = true;
                             }
+                            // c is no longer reachable by the traversal from this point on -- clean up
+                            // any of its own resident descendants now rather than orphaning them.
+                            EvictResidentDescendants(finerLvl, ci);
                         }
                     }
                 }

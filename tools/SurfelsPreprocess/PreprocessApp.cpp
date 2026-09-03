@@ -1136,8 +1136,18 @@ namespace Surfels
 
     void PreprocessApp::ResetStreamingSimulation()
     {
+        if (m_lodStreamChunks.empty())
+        {
+            m_simulatedBytesDelivered = 0.0f;
+            m_streamRefinementProgress = 0.0f;
+            m_evictedSurfelCount = 0;
+            m_demandRequestQueue.clear();
+            m_demandRequestHead = 0;
+            return;
+        }
+
         int numLODs = (int)m_lodStreamChunks.size();
-        int coarsestLvl = numLODs > 0 ? (numLODs - 1) : 0;
+        int coarsestLvl = numLODs - 1;
         int minProtectedLvl = std::max(0, coarsestLvl - 1);
 
         m_evictedSurfelCount = 0;
@@ -1156,9 +1166,9 @@ namespace Surfels
                 sc.isSilhouette = false;
                 sc.transitionProgress = 0.0f;
             }
-            m_lodResidentSurfels[lvl] = 0;
-            m_smoothedLodResidentPct[lvl] = 0.0f;
-            m_smoothedLodResidentBlocks[lvl] = 0;
+            if (lvl < (int)m_lodResidentSurfels.size()) m_lodResidentSurfels[lvl] = 0;
+            if (lvl < (int)m_smoothedLodResidentPct.size()) m_smoothedLodResidentPct[lvl] = 0.0f;
+            if (lvl < (int)m_smoothedLodResidentBlocks.size()) m_smoothedLodResidentBlocks[lvl] = 0;
         }
 
         // 2. Deliver the entirety of max level and max-1 level in 1 go (never streamed in parts)
@@ -1175,9 +1185,9 @@ namespace Surfels
                 sc.transitionProgress = 0.0f;
                 m_simulatedBytesDelivered += (float)sc.byteSize;
             }
-            m_lodResidentSurfels[lvl] = m_lodTotalSurfels[lvl];
-            m_smoothedLodResidentPct[lvl] = 1.0f;
-            m_smoothedLodResidentBlocks[lvl] = 20;
+            if (lvl < (int)m_lodResidentSurfels.size()) m_lodResidentSurfels[lvl] = (lvl < (int)m_lodTotalSurfels.size()) ? m_lodTotalSurfels[lvl] : 0;
+            if (lvl < (int)m_smoothedLodResidentPct.size()) m_smoothedLodResidentPct[lvl] = 1.0f;
+            if (lvl < (int)m_smoothedLodResidentBlocks.size()) m_smoothedLodResidentBlocks[lvl] = 20;
         }
 
         m_demandRequestQueue.clear();
@@ -1197,8 +1207,18 @@ namespace Surfels
 
     void PreprocessApp::ClearResidentStream()
     {
+        if (m_lodStreamChunks.empty())
+        {
+            m_simulatedBytesDelivered = 0.0f;
+            m_streamRefinementProgress = 0.0f;
+            m_evictedSurfelCount = 0;
+            m_demandRequestQueue.clear();
+            m_demandRequestHead = 0;
+            return;
+        }
+
         int numLODs = (int)m_lodStreamChunks.size();
-        int coarsestLvl = numLODs > 0 ? (numLODs - 1) : 0;
+        int coarsestLvl = numLODs - 1;
         int minProtectedLvl = std::max(0, coarsestLvl - 1);
 
         m_evictedSurfelCount = 0;
@@ -1220,9 +1240,9 @@ namespace Surfels
                     sc.isSilhouette = false;
                     sc.transitionProgress = 0.0f;
                 }
-                m_lodResidentSurfels[lvl] = 0;
-                m_smoothedLodResidentPct[lvl] = 0.0f;
-                m_smoothedLodResidentBlocks[lvl] = 0;
+                if (lvl < (int)m_lodResidentSurfels.size()) m_lodResidentSurfels[lvl] = 0;
+                if (lvl < (int)m_smoothedLodResidentPct.size()) m_smoothedLodResidentPct[lvl] = 0.0f;
+                if (lvl < (int)m_smoothedLodResidentBlocks.size()) m_smoothedLodResidentBlocks[lvl] = 0;
             }
             else
             {
@@ -1238,9 +1258,9 @@ namespace Surfels
                     sc.transitionProgress = 0.0f;
                     m_simulatedBytesDelivered += (float)sc.byteSize;
                 }
-                m_lodResidentSurfels[lvl] = m_lodTotalSurfels[lvl];
-                m_smoothedLodResidentPct[lvl] = 1.0f;
-                m_smoothedLodResidentBlocks[lvl] = 20;
+                if (lvl < (int)m_lodResidentSurfels.size()) m_lodResidentSurfels[lvl] = (lvl < (int)m_lodTotalSurfels.size()) ? m_lodTotalSurfels[lvl] : 0;
+                if (lvl < (int)m_smoothedLodResidentPct.size()) m_smoothedLodResidentPct[lvl] = 1.0f;
+                if (lvl < (int)m_smoothedLodResidentBlocks.size()) m_smoothedLodResidentBlocks[lvl] = 20;
             }
         }
 

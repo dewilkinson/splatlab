@@ -2179,24 +2179,25 @@ namespace Surfels
                 return true;
             };
 
-            size_t candidateGpuIndices[512];
-            StreamChunk* candidateStreamChunks[512];
-            ImVec2 candidateScreenPos[512];
-            int candidateCount = 0;
+            std::vector<size_t> candidateGpuIndices;
+            std::vector<StreamChunk*> candidateStreamChunks;
+            std::vector<ImVec2> candidateScreenPos;
+            candidateGpuIndices.reserve(m_rendererMeshletChunks.size());
+            candidateStreamChunks.reserve(m_rendererMeshletChunks.size());
+            candidateScreenPos.reserve(m_rendererMeshletChunks.size());
 
             int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
 
             for (size_t i = 0; i < m_rendererMeshletChunks.size(); i++)
             {
-                if (m_rendererMeshletChunks[i].lodLevel <= (uint32_t)silTargetLOD && m_rendererMeshletChunks[i].isSilhouette > 0.5f && candidateCount < 512)
+                if (m_rendererMeshletChunks[i].lodLevel <= (uint32_t)silTargetLOD && m_rendererMeshletChunks[i].isSilhouette > 0.5f)
                 {
                     ImVec2 sp;
                     if (ProjectPos(m_rendererMeshletChunks[i].center, sp))
                     {
-                        candidateGpuIndices[candidateCount] = i;
-                        candidateStreamChunks[candidateCount] = (i < m_rendererSourceChunks.size()) ? m_rendererSourceChunks[i] : nullptr;
-                        candidateScreenPos[candidateCount] = sp;
-                        candidateCount++;
+                        candidateGpuIndices.push_back(i);
+                        candidateStreamChunks.push_back((i < m_rendererSourceChunks.size()) ? m_rendererSourceChunks[i] : nullptr);
+                        candidateScreenPos.push_back(sp);
                     }
                     else
                     {
@@ -2212,6 +2213,7 @@ namespace Surfels
 
             const float neighborRadiusSq = 90.0f * 90.0f;
             float angles[64];
+            int candidateCount = (int)candidateGpuIndices.size();
 
             for (int i = 0; i < candidateCount; i++)
             {
@@ -2260,6 +2262,13 @@ namespace Surfels
                     if (candidateStreamChunks[i])
                     {
                         candidateStreamChunks[i]->isSilhouette = false;
+                    }
+                }
+                else
+                {
+                    if (candidateStreamChunks[i])
+                    {
+                        candidateStreamChunks[i]->isSilhouette = true;
                     }
                 }
             }
@@ -3762,9 +3771,9 @@ namespace Surfels
                         }
 
                         isLit = (resCount > 0);
-                        // Silhouette segments: only highlighted in lavender when silhouette refinement is active and refined finer than the base target LOD
+                        // Silhouette segments: only highlighted in lavender when a significant portion of resident chunks in this segment are true outer silhouette edges
                         int silTargetLOD = std::max(0, m_selectedPreviewLOD - m_silhouetteLODBias);
-                        bool isSil = (m_enableSilhouetteLOD0 && m_selectedPreviewLOD > silTargetLOD && lodIdx <= silTargetLOD && isLit && silCount > 0);
+                        bool isSil = (m_enableSilhouetteLOD0 && m_selectedPreviewLOD > silTargetLOD && lodIdx <= silTargetLOD && isLit && silCount > 0 && (silCount * 2 >= resCount || (resCount <= 4 && silCount >= 2)));
                         bool isTrans = (isLit && transCount > 0);
 
                         if (isLit)

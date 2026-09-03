@@ -2278,7 +2278,7 @@ namespace Surfels
                     {
                         float dist = sqrtf(d2);
                         float dotOut = (dx * outwardDir.x + dy * outwardDir.y) / dist;
-                        if (dotOut > 0.40f)
+                        if (dotOut > 0.65f && dist > 12.0f)
                         {
                             forwardObstructions++;
                         }
@@ -2305,8 +2305,8 @@ namespace Surfels
                             float gap = angles[k + 1] - angles[k];
                             if (gap > maxGap) maxGap = gap;
                         }
-                        // Must have an open background sector >= 135 degrees facing the empty space
-                        isOuterBoundary = (maxGap >= 2.35f);
+                        // Must have an open background sector >= 110 degrees facing the empty space
+                        isOuterBoundary = (maxGap >= 1.90f);
                     }
                 }
 
@@ -4783,8 +4783,8 @@ namespace Surfels
                     {
                         float dist = sqrtf(d2);
                         float dotOut = (ndx * outwardDir.x + ndy * outwardDir.y) / dist;
-                        // If another chunk is in the forward 120-degree cone (cos > 0.40) of the outward vector:
-                        if (dotOut > 0.40f)
+                        // If another chunk is in the forward 90-degree cone (cos > 0.65) of the outward vector:
+                        if (dotOut > 0.65f && dist > 12.0f)
                         {
                             forwardObstructions++;
                         }
@@ -4799,7 +4799,7 @@ namespace Surfels
                 if (forwardObstructions > 0)
                     continue;
 
-                // Must also have an open angular sector >= 135 degrees facing the background
+                // Must also have an open angular sector >= 110 degrees facing the background
                 if (angleCount >= 3)
                 {
                     std::sort(angles, angles + angleCount);
@@ -4809,7 +4809,7 @@ namespace Surfels
                         float gap = angles[k + 1] - angles[k];
                         if (gap > maxGap) maxGap = gap;
                     }
-                    if (maxGap < 2.35f)
+                    if (maxGap < 1.90f)
                         continue;
                 }
 

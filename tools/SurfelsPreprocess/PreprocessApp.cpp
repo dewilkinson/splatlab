@@ -2149,8 +2149,12 @@ namespace Surfels
             std::vector<StreamChunk*> candidateStreamChunks;
             std::vector<ImVec2> candidateScreenPos;
             candidateGpuIndices.reserve(m_rendererMeshletChunks.size());
-            candidateStreamChunks.reserve(m_rendererMeshletChunks.size());
-            candidateScreenPos.reserve(m_rendererMeshletChunks.size());
+            std::vector<ImVec2> allChunkScreenPos(m_rendererMeshletChunks.size());
+            std::vector<bool>   allChunkScreenValid(m_rendererMeshletChunks.size(), false);
+            for (size_t i = 0; i < m_rendererMeshletChunks.size(); i++)
+            {
+                allChunkScreenValid[i] = ProjectPos(m_rendererMeshletChunks[i].center, allChunkScreenPos[i]);
+            }
 
             int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
 
@@ -2158,12 +2162,11 @@ namespace Surfels
             {
                 if (m_rendererMeshletChunks[i].lodLevel <= (uint32_t)silTargetLOD && m_rendererMeshletChunks[i].isSilhouette > 0.5f)
                 {
-                    ImVec2 sp;
-                    if (ProjectPos(m_rendererMeshletChunks[i].center, sp))
+                    if (allChunkScreenValid[i])
                     {
                         candidateGpuIndices.push_back(i);
                         candidateStreamChunks.push_back((i < m_rendererSourceChunks.size()) ? m_rendererSourceChunks[i] : nullptr);
-                        candidateScreenPos.push_back(sp);
+                        candidateScreenPos.push_back(allChunkScreenPos[i]);
                     }
                     else
                     {
@@ -2177,24 +2180,52 @@ namespace Surfels
                 }
             }
 
-            const float neighborRadiusSq = 90.0f * 90.0f;
-            float angles[64];
+            const float neighborRadius = 65.0f;
+            const float neighborRadiusSq = neighborRadius * neighborRadius;
+            float angles[128];
             int candidateCount = (int)candidateGpuIndices.size();
 
             for (int i = 0; i < candidateCount; i++)
             {
-                int angleCount = 0;
+                size_t gpuIdx = candidateGpuIndices[i];
+                const auto& chunkGpu = m_rendererMeshletChunks[gpuIdx];
                 const ImVec2& p0 = candidateScreenPos[i];
 
-                for (int j = 0; j < candidateCount; j++)
+                // Calculate 2D outward screen normal vector
+                XMFLOAT3 normalPt(
+                    chunkGpu.center.x + chunkGpu.coneAxis.x * std::max(0.05f, chunkGpu.boundingRadius),
+                    chunkGpu.center.y + chunkGpu.coneAxis.y * std::max(0.05f, chunkGpu.boundingRadius),
+                    chunkGpu.center.z + chunkGpu.coneAxis.z * std::max(0.05f, chunkGpu.boundingRadius)
+                );
+                ImVec2 sNorm;
+                ImVec2 outwardDir(0.0f, -1.0f);
+                if (ProjectPos(normalPt, sNorm))
                 {
-                    if (i == j) continue;
-                    float dx = candidateScreenPos[j].x - p0.x;
-                    float dy = candidateScreenPos[j].y - p0.y;
+                    float dx = sNorm.x - p0.x;
+                    float dy = sNorm.y - p0.y;
+                    float len = sqrtf(dx * dx + dy * dy);
+                    if (len > 0.05f) outwardDir = ImVec2(dx / len, dy / len);
+                }
+
+                int forwardObstructions = 0;
+                int angleCount = 0;
+
+                // Check against ALL active scene chunks to detect if this normal points into the model
+                for (size_t j = 0; j < m_rendererMeshletChunks.size(); j++)
+                {
+                    if (gpuIdx == j || !allChunkScreenValid[j]) continue;
+                    float dx = allChunkScreenPos[j].x - p0.x;
+                    float dy = allChunkScreenPos[j].y - p0.y;
                     float d2 = dx * dx + dy * dy;
-                    if (d2 <= neighborRadiusSq && d2 > 4.0f)
+                    if (d2 <= neighborRadiusSq && d2 > 9.0f)
                     {
-                        if (angleCount < 64)
+                        float dist = sqrtf(d2);
+                        float dotOut = (dx * outwardDir.x + dy * outwardDir.y) / dist;
+                        if (dotOut > 0.40f)
+                        {
+                            forwardObstructions++;
+                        }
+                        if (angleCount < 128)
                         {
                             angles[angleCount++] = atan2f(dy, dx);
                         }
@@ -2202,27 +2233,28 @@ namespace Surfels
                 }
 
                 bool isOuterBoundary = false;
-                if (angleCount < 3)
+                if (forwardObstructions == 0)
                 {
-                    isOuterBoundary = true;
-                }
-                else
-                {
-                    std::sort(angles, angles + angleCount);
-                    float maxGap = (angles[0] + 6.2831853f) - angles[angleCount - 1];
-                    for (int k = 0; k < angleCount - 1; k++)
+                    if (angleCount < 3)
                     {
-                        float gap = angles[k + 1] - angles[k];
-                        if (gap > maxGap) maxGap = gap;
+                        isOuterBoundary = true;
                     }
-
-                    // Must have an open angular sector >= 120 degrees facing the background
-                    isOuterBoundary = (maxGap >= 2.09f);
+                    else
+                    {
+                        std::sort(angles, angles + angleCount);
+                        float maxGap = (angles[0] + 6.2831853f) - angles[angleCount - 1];
+                        for (int k = 0; k < angleCount - 1; k++)
+                        {
+                            float gap = angles[k + 1] - angles[k];
+                            if (gap > maxGap) maxGap = gap;
+                        }
+                        // Must have an open background sector >= 135 degrees facing the empty space
+                        isOuterBoundary = (maxGap >= 2.35f);
+                    }
                 }
 
                 if (!isOuterBoundary)
                 {
-                    size_t gpuIdx = candidateGpuIndices[i];
                     m_rendererMeshletChunks[gpuIdx].isSilhouette = 0.0f;
                     m_rendererMeshletChunks[gpuIdx].dilationMorph = 0.0f;
                     if (candidateStreamChunks[i])
@@ -4629,89 +4661,112 @@ namespace Surfels
             const uint32_t activeChunkCount = m_state.chunkCount > 0 ? m_state.chunkCount : (uint32_t)m_rendererMeshletChunks.size();
             const MeshletChunkGPU* pActiveChunks = m_state.pChunks ? m_state.pChunks : m_rendererMeshletChunks.data();
 
+            std::vector<ImVec2> allScreenPos(activeChunkCount);
+            std::vector<bool>   allScreenValid(activeChunkCount, false);
+            for (uint32_t j = 0; j < activeChunkCount && pActiveChunks != nullptr; j++)
+            {
+                allScreenValid[j] = ProjectToScreen(pActiveChunks[j].center, allScreenPos[j]);
+            }
+
+            const float checkRadius = 65.0f;
+            const float checkRadiusSq = checkRadius * checkRadius;
+            float angles[128];
+
             for (uint32_t i = 0; i < activeChunkCount && pActiveChunks != nullptr; i++)
             {
+                if (!allScreenValid[i]) continue;
                 const auto& chunkGpu = pActiveChunks[i];
-                bool isSil = (chunkGpu.isSilhouette > 0.5f);
 
                 float toCamX = eyePos.x - chunkGpu.center.x;
                 float toCamY = eyePos.y - chunkGpu.center.y;
                 float toCamZ = eyePos.z - chunkGpu.center.z;
                 float toCamDist = sqrtf(toCamX * toCamX + toCamY * toCamY + toCamZ * toCamZ);
+                if (toCamDist <= 1e-4f) continue;
 
-                if (!isSil)
+                // 1. Grazing Angle: Surface normal must be nearly perpendicular to camera view ray
+                float dotNV = (chunkGpu.coneAxis.x * toCamX + chunkGpu.coneAxis.y * toCamY + chunkGpu.coneAxis.z * toCamZ) / toCamDist;
+                if (fabsf(dotNV) > m_silhouetteThreshold) continue;
+
+                ImVec2 sp = allScreenPos[i];
+
+                // 2. Projected 2D Outward Screen Normal Direction
+                XMFLOAT3 normalPt(
+                    chunkGpu.center.x + chunkGpu.coneAxis.x * std::max(0.05f, chunkGpu.boundingRadius),
+                    chunkGpu.center.y + chunkGpu.coneAxis.y * std::max(0.05f, chunkGpu.boundingRadius),
+                    chunkGpu.center.z + chunkGpu.coneAxis.z * std::max(0.05f, chunkGpu.boundingRadius)
+                );
+
+                ImVec2 sNorm;
+                if (!ProjectToScreen(normalPt, sNorm)) continue;
+                float dx = sNorm.x - sp.x;
+                float dy = sNorm.y - sp.y;
+                float len = sqrtf(dx * dx + dy * dy);
+                if (len <= 0.05f) continue;
+                ImVec2 outwardDir(dx / len, dy / len);
+
+                // 3. Screen-Space Horizon Clearance & Tolerance Cone:
+                // Check all active scene chunks to verify this normal points out into empty background (NOT into the model!)
+                int forwardObstructions = 0;
+                int angleCount = 0;
+
+                for (uint32_t j = 0; j < activeChunkCount; j++)
                 {
-                    if (i < m_rendererSourceChunks.size() && m_rendererSourceChunks[i])
+                    if (i == j || !allScreenValid[j]) continue;
+                    float ndx = allScreenPos[j].x - sp.x;
+                    float ndy = allScreenPos[j].y - sp.y;
+                    float d2 = ndx * ndx + ndy * ndy;
+                    if (d2 <= checkRadiusSq && d2 > 9.0f)
                     {
-                        isSil = m_rendererSourceChunks[i]->isSilhouette;
-                    }
-                    
-                    if (!isSil && toCamDist > 1e-4f)
-                    {
-                        float dotNV = (chunkGpu.coneAxis.x * toCamX + chunkGpu.coneAxis.y * toCamY + chunkGpu.coneAxis.z * toCamZ) / toCamDist;
-                        if (fabsf(dotNV) <= m_silhouetteThreshold)
+                        float dist = sqrtf(d2);
+                        float dotOut = (ndx * outwardDir.x + ndy * outwardDir.y) / dist;
+                        // If another chunk is in the forward 120-degree cone (cos > 0.40) of the outward vector:
+                        if (dotOut > 0.40f)
                         {
-                            isSil = true;
+                            forwardObstructions++;
+                        }
+                        if (angleCount < 128)
+                        {
+                            angles[angleCount++] = atan2f(ndy, ndx);
                         }
                     }
                 }
 
-                if (isSil)
+                // If pointing into another part of the model, reject
+                if (forwardObstructions > 0)
+                    continue;
+
+                // Must also have an open angular sector >= 135 degrees facing the background
+                if (angleCount >= 3)
                 {
-                    ImVec2 sp;
-                    if (ProjectToScreen(chunkGpu.center, sp))
+                    std::sort(angles, angles + angleCount);
+                    float maxGap = (angles[0] + 6.2831853f) - angles[angleCount - 1];
+                    for (int k = 0; k < angleCount - 1; k++)
                     {
-                        // Check if within 16-pixel radius of any already placed billboard square
-                        bool tooClose = false;
-                        for (const auto& placed : placedDots)
-                        {
-                            float dx = sp.x - placed.pos.x;
-                            float dy = sp.y - placed.pos.y;
-                            if (dx * dx + dy * dy < minRadiusSq)
-                            {
-                                tooClose = true;
-                                break;
-                            }
-                        }
-
-                        if (!tooClose)
-                        {
-                            // Calculate outward screen normal direction perpendicular to silhouette edge
-                            XMFLOAT3 normalPt(
-                                chunkGpu.center.x + chunkGpu.coneAxis.x * std::max(0.05f, chunkGpu.boundingRadius),
-                                chunkGpu.center.y + chunkGpu.coneAxis.y * std::max(0.05f, chunkGpu.boundingRadius),
-                                chunkGpu.center.z + chunkGpu.coneAxis.z * std::max(0.05f, chunkGpu.boundingRadius)
-                            );
-
-                            ImVec2 sNorm;
-                            ImVec2 outwardDir(0.0f, -1.0f);
-                            if (ProjectToScreen(normalPt, sNorm))
-                            {
-                                float dx = sNorm.x - sp.x;
-                                float dy = sNorm.y - sp.y;
-                                float len = sqrtf(dx * dx + dy * dy);
-                                if (len > 0.05f)
-                                {
-                                    outwardDir = ImVec2(dx / len, dy / len);
-                                }
-                                else
-                                {
-                                    ImVec2 sTarget;
-                                    if (ProjectToScreen(m_target, sTarget))
-                                    {
-                                        float tdx = sp.x - sTarget.x;
-                                        float tdy = sp.y - sTarget.y;
-                                        float tlen = sqrtf(tdx * tdx + tdy * tdy);
-                                        if (tlen > 0.05f) outwardDir = ImVec2(tdx / tlen, tdy / tlen);
-                                    }
-                                }
-                            }
-
-                            placedDots.push_back({ sp, outwardDir, toCamDist });
-                            if (toCamDist < minDepth) minDepth = toCamDist;
-                            if (toCamDist > maxDepth) maxDepth = toCamDist;
-                        }
+                        float gap = angles[k + 1] - angles[k];
+                        if (gap > maxGap) maxGap = gap;
                     }
+                    if (maxGap < 2.35f)
+                        continue;
+                }
+
+                // 4. Poisson 16px radius minimum spacing
+                bool tooClose = false;
+                for (const auto& placed : placedDots)
+                {
+                    float pdx = sp.x - placed.pos.x;
+                    float pdy = sp.y - placed.pos.y;
+                    if (pdx * pdx + pdy * pdy < minRadiusSq)
+                    {
+                        tooClose = true;
+                        break;
+                    }
+                }
+
+                if (!tooClose)
+                {
+                    placedDots.push_back({ sp, outwardDir, toCamDist });
+                    if (toCamDist < minDepth) minDepth = toCamDist;
+                    if (toCamDist > maxDepth) maxDepth = toCamDist;
                 }
             }
 

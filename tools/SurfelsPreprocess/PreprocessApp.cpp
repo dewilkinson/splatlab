@@ -1524,6 +1524,7 @@ namespace Surfels
         if (cameraMoved)
         {
             m_lastStreamCamPos = { m_yaw, m_pitch, m_distance };
+            m_streamStateDirty = true;
 
             // Invalidate and release all silhouette locks across all chunks immediately upon rotation/movement
             for (auto& lvlList : m_lodStreamChunks)
@@ -1745,9 +1746,20 @@ namespace Surfels
             targetLOD = std::max(0, std::min(numLODs - 1, m_selectedPreviewLOD));
         }
 
-        // Fast In-Place Dirty State Gate: If resident chunks & topology have not changed,
+        // Check if any chunks are actively mid-transition (0.001 < transitionProgress < 0.999)
+        bool hasActiveTransitions = false;
+        for (auto* pChunk : m_allStreamChunkPtrs)
+        {
+            if (pChunk && pChunk->isResident && pChunk->transitionProgress > 0.001f && pChunk->transitionProgress < 0.999f)
+            {
+                hasActiveTransitions = true;
+                break;
+            }
+        }
+
+        // Fast In-Place Dirty State Gate: If resident chunks & topology have not changed, and no transitions are active,
         // update chunk shaders/timers directly in place without re-copying millions of surfels or re-uploading full VRAM
-        if (!m_streamStateDirty && !m_rendererMeshletChunks.empty() && m_rendererMeshletChunks.size() == m_rendererSourceChunks.size())
+        if (!m_streamStateDirty && !hasActiveTransitions && !m_rendererMeshletChunks.empty() && m_rendererMeshletChunks.size() == m_rendererSourceChunks.size())
         {
             int silTargetLOD = std::max(0, targetLOD - m_silhouetteLODBias);
             for (size_t i = 0; i < m_rendererMeshletChunks.size(); i++)
@@ -3738,7 +3750,7 @@ namespace Surfels
                             if (chunk.isResident)
                             {
                                 resCount++;
-                                if (chunk.isLockedInTransition)
+                                if (chunk.isLockedInTransition && chunk.transitionProgress > 0.001f && chunk.transitionProgress < 0.999f)
                                 {
                                     transCount++;
                                 }

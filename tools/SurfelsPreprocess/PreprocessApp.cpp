@@ -338,6 +338,13 @@ namespace Surfels
         }
     }
 
+    // Ring buffer slider ceiling: 512 MB, or twice the loaded dataset's total stream size, whichever is
+    // larger. Shared by the slider and the per-dataset default so the two can never disagree.
+    float PreprocessApp::MaxRingBufferMB() const
+    {
+        return std::max(512.0f, std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f) * 2.0f));
+    }
+
     // Persists the current config-file-backed settings back to disk
     void PreprocessApp::SaveConfigFile()
     {
@@ -1531,11 +1538,10 @@ namespace Surfels
             }
         }
 
-        float requiredMB = std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f));
-        if (m_ringBufferCapacityMB < requiredMB)
-        {
-            m_ringBufferCapacityMB = std::max(64.0f, requiredMB * 1.25f);
-        }
+        // Default the ring buffer to its slider ceiling for this dataset (the whole stream fits with room
+        // to spare); the Renderer tab's GPU Ring Buffer Size slider can then be pulled down to simulate a
+        // tighter budget.
+        m_ringBufferCapacityMB = MaxRingBufferMB();
 
         m_lastStreamCamPos = { 1e9f, 1e9f, 1e9f };
         m_lastStreamYaw = 1e9f;
@@ -3515,7 +3521,7 @@ namespace Surfels
                     {
                         ImGui::SameLine();
                         ImGui::PushItemWidth(100.0f);
-                        if (ImGui::SliderFloat("##DitherDurationTab", &m_ditherTransitionDurationSec, 0.05f, 0.50f, "%.2f s"))
+                        if (ImGui::SliderFloat("##DitherDurationTab", &m_ditherTransitionDurationSec, 0.05f, 5.0f, "%.2f s"))
                         {
                             m_streamStateDirty = true;
                         }
@@ -3869,7 +3875,7 @@ namespace Surfels
                     ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Removes bandwidth throttle caps and streams at uncapped maximum rate.");
 
-                    float maxRingMB = std::max(512.0f, std::ceil(m_totalStreamBytes / (1024.0f * 1024.0f) * 2.0f));
+                    float maxRingMB = MaxRingBufferMB();
 
                     if (m_unthrottledBandwidth)
                     {

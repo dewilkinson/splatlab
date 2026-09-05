@@ -223,40 +223,16 @@ namespace Surfels
 
         ImGUI_Init((void*)m_windowHwnd);
 
-        // Load initial scene: command line argument or default to Venus dataset
+        // Load initial scene: only from an explicit command line argument. No dataset is auto-loaded
+        // by default -- the user must select one via File -> Open (or pass a path on the command line).
         if (strlen(m_inputPathBuf) > 0)
         {
             LoadFile(m_inputPathBuf);
         }
         else
         {
-            const char* defaultVenusPaths[] = {
-                "datasets/Venus/scene.ply",
-                "../datasets/Venus/scene.ply",
-                "../../datasets/Venus/scene.ply",
-                "C:/github/datasets/Venus/scene.ply"
-            };
-
-            bool loaded = false;
-            for (const char* path : defaultVenusPaths)
-            {
-                std::ifstream check(path, std::ios::binary);
-                if (check.good())
-                {
-                    check.close();
-                    if (LoadFile(path))
-                    {
-                        loaded = true;
-                        break;
-                    }
-                }
-            }
-
-            if (!loaded)
-            {
-                m_statusMessage = "Ready. Use File -> Open to load a .ply or .splat dataset.";
-                m_statusIsSuccess = true;
-            }
+            m_statusMessage = "Ready. Use File -> Open to load a .ply or .splat dataset.";
+            m_statusIsSuccess = true;
         }
 
         m_swapChain.SetVSync(m_vsync);
@@ -1680,9 +1656,26 @@ namespace Surfels
 
         // 2. Continuous LRU Cache Decay: Mark finer detail chunks for graceful eviction
         // Note: The highest two mip levels (coarsestLvl and coarsestLvl - 1) are permanently pinned and never evicted!
+        // The budget is paced against the actual evictable byte total (everything except the two pinned
+        // levels) so that at max rate (10.0) a full drain completes within ~10 seconds regardless of
+        // dataset size or bandwidth -- eviction itself doesn't consume network bandwidth, this budget is
+        // the only thing pacing it. Rate scales linearly below max (half rate = twice the time, etc).
         if (m_enableStreamDecay && m_streamDecayRate > 0.0f && m_simulatedBytesDelivered > 0.0f)
         {
-            float decayBytes = (float)(dtSeconds * m_streamDecayRate * std::max(2.0f * 1024.0f * 1024.0f, m_totalStreamBytes * 0.50f));
+            constexpr float kMaxDecayRate = 10.0f;
+            constexpr float kFullDrainSecondsAtMaxRate = 10.0f;
+            size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
+            float pinnedBytes = 0.0f;
+            if (coarsestLvl >= 0 && coarsestLvl < (int)m_lodTotalSurfels.size())
+            {
+                pinnedBytes += (float)(m_lodTotalSurfels[coarsestLvl] * bytesPerSurfel);
+            }
+            if (coarsestLvl - 1 >= 0 && coarsestLvl - 1 < (int)m_lodTotalSurfels.size())
+            {
+                pinnedBytes += (float)(m_lodTotalSurfels[coarsestLvl - 1] * bytesPerSurfel);
+            }
+            float evictableBytes = std::max(0.0f, m_totalStreamBytes - pinnedBytes);
+            float decayBytes = (float)dtSeconds * (evictableBytes / kFullDrainSecondsAtMaxRate) * (m_streamDecayRate / kMaxDecayRate);
             int maxEvictableLOD = std::max(0, coarsestLvl - 1); // Protect highest two mip levels
             for (int lvl = 0; lvl < maxEvictableLOD && decayBytes > 0.0f; lvl++)
             {
@@ -4193,7 +4186,7 @@ namespace Surfels
 
         ImGui::SameLine();
         ImGui::PushItemWidth(availWidth - 165.0f);
-        if (ImGui::SliderFloat("##DecaySlider", &m_streamDecayRate, 0.0f, 1.0f, "Decay Rate: %.2f"))
+        if (ImGui::SliderFloat("##DecaySlider", &m_streamDecayRate, 0.0f, 10.0f, "Decay Rate: %.2f"))
         {
             m_streamStateDirty = true;
         }

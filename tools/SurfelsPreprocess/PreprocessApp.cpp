@@ -1636,7 +1636,7 @@ namespace Surfels
             {
                 sc.isRequested = false;
                 sc.isDelivered = false;
-                sc.isResident = false;
+                sc.isResident = false; m_residencyEpoch++;
                 sc.isEvictionPending = false;
                 sc.isLockedInTransition = false;
                 sc.isSilhouette = false;
@@ -1711,7 +1711,7 @@ namespace Surfels
                 {
                     sc.isRequested = false;
                     sc.isDelivered = false;
-                    sc.isResident = false;
+                    sc.isResident = false; m_residencyEpoch++;
                     sc.isEvictionPending = false;
                     sc.isLockedInTransition = false;
                     sc.isSilhouette = false;
@@ -2131,18 +2131,16 @@ namespace Surfels
         // decay with an effectively unthrottled bandwidth budget. On-demand requests driven by what's
         // actually needed for the current view (TraverseNode's own RequestChunk calls) are untouched --
         // only this background/ahead-of-need prefetching is paused.
-        if (m_streamingPolicy == StreamingPolicy::Greedy && !m_enableStreamDecay && (m_demandRequestQueue.size() - m_demandRequestHead) < 32)
+        // multiplex their priority lists into this frame's scratch load list. The delivery simulator
+        // below consumes it right after the edge chunks, so every visible face grows at once, most
+        // detailed regions first, and faces the camera cannot see wait until they come into view.
+        m_scratchLoadList.clear();
+        if (m_streamingPolicy == StreamingPolicy::Greedy && !m_enableStreamDecay)
         {
-            // the prefetcher hands the delivery simulator already grows the model's detail first.
-            size_t bgQueued = 0;
-            {
-                if (bgQueued >= 32) break;
-                StreamChunk& chunk = *pChunk;
-                if (!chunk.isResident && !chunk.isRequested && !chunk.isEvictionPending)
-                {
-                    bgQueued++;
-                }
-            }
+            // Only as many candidates as this frame's bandwidth could deliver (plus slack), so a
+            // throttled stream does not build thousands of entries a frame it will never touch.
+            const float estBudget = m_unthrottledBandwidth ? 1e9f : (float)(dtSeconds * m_bandwidthThrottleMBps * 1024.0 * 1024.0);
+            const size_t want = (size_t)std::max(64.0f, std::min(2048.0f, estBudget / 512.0f + 64.0f));
         }
 
         // 5. Update Priorities & Sort Demand Requests (every frame)
@@ -2192,33 +2190,35 @@ namespace Surfels
             float bandwidthBytesPerSec = m_bandwidthThrottleMBps * 1024.0f * 1024.0f;
             float budget = m_unthrottledBandwidth ? 1e9f : (float)(dtSeconds * bandwidthBytesPerSec);
 
-            while (budget > 0.0f && m_demandRequestHead < m_demandRequestQueue.size())
+            // Delivers one block if it is still wanted and fits the ring buffer. Returns false only when
+            // the ring buffer is full (nothing more can land this frame).
+            auto deliverChunk = [&](StreamChunk& chunk) -> bool
             {
-                ChunkRequest req = m_demandRequestQueue[m_demandRequestHead++];
-                if (req.lodLevel < 0 || req.lodLevel >= numLODs) continue;
-                if (req.chunkIndex >= m_lodStreamChunks[req.lodLevel].size()) continue;
-
-                auto& chunk = m_lodStreamChunks[req.lodLevel][req.chunkIndex];
-
-                if (!chunk.isResident && !chunk.isEvictionPending)
+                if (chunk.isResident || chunk.isEvictionPending) return true;
+                float cBytes = (float)chunk.byteSize;
+                if (currentResidentBytes + cBytes > maxResidentBytes)
                 {
-                    float cBytes = (float)chunk.byteSize;
-                    if (currentResidentBytes + cBytes > maxResidentBytes)
-                    {
-                        chunk.isRequested = false;
-                        break;
-                    }
-
-                    chunk.isResident = true;
-                    chunk.isDelivered = true;
                     chunk.isRequested = false;
-                    chunk.streamWaveTimer = m_chunkStreamDuration; // Arrival glow (Show Streaming Arrivals); edge chunks included
-                    m_simulatedBytesDelivered += cBytes;
-                    currentResidentBytes += cBytes;
-                    budget -= cBytes;
-                    m_streamStateDirty = true;
+                    return false;
                 }
+                chunk.isResident = true;
+                chunk.isDelivered = true;
+                chunk.isRequested = false;
+                chunk.streamWaveTimer = m_chunkStreamDuration; // Arrival glow (Show Streaming Arrivals); edge chunks included
+                m_simulatedBytesDelivered += cBytes;
+                currentResidentBytes += cBytes;
+                budget -= cBytes;
+                m_streamStateDirty = true;
+                return true;
+            };
+            // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+            // 1. Edge chunks and the coarse bootstrap envelope (TIER 1 and above) always land first.
+            for (StreamChunk* pChunk : m_scratchLoadList)
+            {
+                if (budget <= 0.0f) break;
+                if (!deliverChunk(*pChunk)) break;
             }
+            // 3. Whatever else the view asked for (out-of-face stragglers, Conservative-mode demands).
 
             // Cleanup processed head
             if (m_demandRequestHead > 256 || m_demandRequestHead >= m_demandRequestQueue.size())
@@ -2420,7 +2420,7 @@ namespace Surfels
                 auto& gc = m_lodStreamChunks[childLvl][ci];
                 if (gc.isResident)
                 {
-                    gc.isResident = false;
+                    gc.isResident = false; m_residencyEpoch++;
                     gc.isDelivered = false;
                     gc.isRequested = false;
                     gc.isEvictionPending = false;
@@ -2650,7 +2650,7 @@ namespace Surfels
                         {
                             if (c.isResident)
                             {
-                                c.isResident = false;
+                                c.isResident = false; m_residencyEpoch++;
                                 c.isDelivered = false;
                                 c.isRequested = false;
                                 c.isEvictionPending = false;
@@ -4675,6 +4675,49 @@ namespace Surfels
         ImGui::Spacing();
     }
 
+    // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+
+    // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+
+    // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+
+    // camera), hidden faces dim, a marker for the camera direction, and the pending block count per face.
+    {
+        uint32_t visible = 0;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Faces of the 8-sided prism around the model that the camera can currently see. Only their priority lists are streamed (interleaved, most directly facing face first); the rest wait until they come into view.");
+
+        const float R = 30.0f;
+        ImVec2 origin = ImGui::GetCursorScreenPos();
+        ImVec2 c(origin.x + R + 6.0f, origin.y + R + 6.0f);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        {
+            // Screen mapping is a top-down view: +X right, +Z down. Face f spans yaw f*45 +/- 22.5 degrees.
+            const float a0 = ((float)f - 0.5f) * 0.78539816f, a1 = ((float)f + 0.5f) * 0.78539816f;
+            ImVec2 p0(c.x + cosf(a0) * R, c.y + sinf(a0) * R);
+            ImVec2 p1(c.x + cosf(a1) * R, c.y + sinf(a1) * R);
+            const bool vis = (m_visibleFaceMask & (1u << f)) != 0;
+            const float t = vis ? std::max(0.0f, std::min(1.0f, (m_faceFacing[f] + 0.15f) / 1.15f)) : 0.0f;
+            ImU32 col = vis ? IM_COL32((int)(60 + 40 * (1 - t)), (int)(150 + 105 * t), (int)(80 + 40 * t), 255) : IM_COL32(70, 72, 80, 255);
+            dl->AddTriangleFilled(c, p0, p1, vis ? IM_COL32(35, 120, 60, 110) : IM_COL32(40, 40, 46, 110));
+            dl->AddLine(p0, p1, col, vis ? 3.0f : 1.5f);
+        }
+        // Camera direction marker (where the eye is, seen from above)
+        float bestF = -2.0f; int lead = 0;
+        const float la = (float)lead * 0.78539816f;
+        dl->AddCircleFilled(ImVec2(c.x + cosf(la) * (R + 7.0f), c.y + sinf(la) * (R + 7.0f)), 3.5f, IM_COL32(255, 220, 90, 255));
+        ImGui::Dummy(ImVec2(2.0f * R + 12.0f, 2.0f * R + 12.0f));
+        if (ImGui::IsItemHovered())
+        {
+            std::string tip = "Pending blocks per face (0 = +X, 2 = +Z, 4 = -X, 6 = -Z; yellow dot = camera side):";
+            {
+                char b[64];
+                snprintf(b, sizeof(b), "\n  face %d: %u %s", f, m_faceRemaining[f], (m_visibleFaceMask & (1u << f)) ? "(visible)" : "");
+                tip += b;
+            }
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
+
     // Overlay listing every toggle that currently alters what the viewport shows -- debug views, isolation
     // modes, frozen state, forced levels -- as "[X Mode Enabled]" lines, one per row, each in its own
     // colour, anchored at the top-left of the viewport next to the control panel. Its purpose is purely
@@ -4703,7 +4746,7 @@ namespace Surfels
         if (m_showOcclusionVolumeOnly)     add(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), "[View Occlusion Volume Only Mode Enabled]");
         if (m_showOnlyLockedChunks)        add(ImVec4(1.00f, 0.60f, 0.20f, 1.0f), "[Show ONLY Locked Chunks Mode Enabled]");
         if (m_highlightSilhouetteChunks)   add(ImVec4(0.78f, 0.68f, 1.00f, 1.0f), "[Highlight Edge Chunks Mode Enabled]");
-        if (m_showChunkStream)             add(ImVec4(1.00f, 0.62f, 0.20f, 1.0f), "[Streaming Arrival Glow Mode Enabled]");
+        if (m_showChunkStream)             add(ImVec4(1.00f, 0.62f, 0.20f, 1.0f), "[Refinement Visualizer (Orange Glow) Mode Enabled]");
         if (m_showClusterHeatmap)          add(ImVec4(1.00f, 0.45f, 0.35f, 1.0f), m_heatmapSource == 1 ? "[Detail Heatmap Cluster Cubes Mode Enabled]" : "[Density Heatmap Cluster Cubes Mode Enabled]");
         if (m_showHeatmapWireframe)        add(ImVec4(0.92f, 0.82f, 0.60f, 1.0f), "[Cube Outlines Mode Enabled]");
         if (m_showOctreeVisualizer)        add(ImVec4(1.00f, 0.75f, 0.20f, 1.0f), "[Macro Clusters Mode Enabled]");

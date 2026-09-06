@@ -956,6 +956,21 @@ namespace Surfels
         // Unquantize surfels to raw format
         m_rendererRawSurfels = Quantizer::UnquantizeSurfels(m_rendererSurfels, m_aabbMin, m_aabbMax);
 
+        // Detail heatmap: v7+ packages carry the one baked from the original cloud; older ones get a
+        // grid rebuilt here from the reconstructed LOD 0 (same measures, slightly lossier input).
+        if (m_loadedPackage.detailGrid.Valid())
+        {
+            m_detailGrid = m_loadedPackage.detailGrid;
+            LogTransitionTrace("DetailHeatmap: %ux%ux%u cells (%.4f m), %u occupied, read from package",
+                m_detailGrid.nx, m_detailGrid.ny, m_detailGrid.nz, m_detailGrid.cellSize, m_detailGrid.occupiedCells);
+        }
+        else
+        {
+            m_detailGrid = DetailGrid::Build(m_rendererRawSurfels, m_aabbMin, m_aabbMax);
+            LogTransitionTrace("DetailHeatmap: %ux%ux%u cells (%.4f m), %u occupied, rebuilt from LOD 0 (pre-v7 package)",
+                m_detailGrid.nx, m_detailGrid.ny, m_detailGrid.nz, m_detailGrid.cellSize, m_detailGrid.occupiedCells);
+        }
+
         // Partition into GPU micro-meshlets (64 surfels per meshlet chunk)
         m_rendererMeshletChunks.clear();
         SpatialOctree::PartitionIntoMeshletChunks(
@@ -1278,6 +1293,11 @@ namespace Surfels
         m_state.splatRadius = 1.0f;
         m_state.orientMode  = 0; // Default to Normal-Oriented Surface Tangent Discs
 
+        // the edge chunks) and ships inside the exported package. See DetailHeatmap.h.
+        m_detailGrid = DetailGrid::Build(m_rawSurfels, m_aabbMin, m_aabbMax);
+        LogTransitionTrace("DetailHeatmap: %ux%ux%u cells (%.4f m), %u occupied, built from %zu raw points",
+            m_detailGrid.nx, m_detailGrid.ny, m_detailGrid.nz, m_detailGrid.cellSize, m_detailGrid.occupiedCells, m_rawSurfels.size());
+
         // 2. Partition into Spatial Octree Chunks
         m_chunks = SpatialOctree::PartitionIntoChunks(m_rawSurfels, m_chunkSize);
 
@@ -1560,6 +1580,7 @@ namespace Surfels
                 }
                 sc.aabbMin = aMin;
                 sc.aabbMax = aMax;
+                sc.detailScore = m_detailGrid.Valid() ? m_detailGrid.SampleBox(aMin, aMax) : 0.0f;
                 sc.streamWaveTimer = 0.0f;
 
                 m_totalStreamBytes += (float)sc.byteSize;
@@ -1571,6 +1592,8 @@ namespace Surfels
                 m_allStreamChunkPtrs.push_back(&chunk);
             }
         }
+
+        // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
 
         // Default the ring buffer to its slider ceiling for this dataset (the whole stream fits with room
         // to spare); the Renderer tab's GPU Ring Buffer Size slider can then be pulled down to simulate a
@@ -2175,16 +2198,14 @@ namespace Surfels
         // only this background/ahead-of-need prefetching is paused.
         if (m_streamingPolicy == StreamingPolicy::Greedy && !m_enableStreamDecay && (m_demandRequestQueue.size() - m_demandRequestHead) < 32)
         {
+            // the prefetcher hands the delivery simulator already grows the model's detail first.
             size_t bgQueued = 0;
-            for (int lvl = coarsestLvl; lvl >= 0 && bgQueued < 32; lvl--)
             {
-                for (size_t c = 0; c < m_lodStreamChunks[lvl].size() && bgQueued < 32; c++)
+                if (bgQueued >= 32) break;
+                StreamChunk& chunk = *pChunk;
+                if (!chunk.isResident && !chunk.isRequested && !chunk.isEvictionPending)
                 {
-                    auto& chunk = m_lodStreamChunks[lvl][c];
-                    if (!chunk.isResident && !chunk.isRequested && !chunk.isEvictionPending)
-                    {
-                        bgQueued++;
-                    }
+                    bgQueued++;
                 }
             }
         }
@@ -2818,7 +2839,7 @@ namespace Surfels
         // m_occlusionVoxels is already current: the occlusion sliders rebuild it live, and any pending
         // chunking/wavelet change is applied the moment its slider is released (before a click on Save
         // can land), so nothing exported here can be stale.
-        if (StreamPackager::PackageDataset(outputPath, m_chunks, m_maxLODLevels, deadbandMeters, m_state.splatRadius, m_occlusionVoxels, m_sourceFileBytes, &m_occlusionMips))
+        if (StreamPackager::PackageDataset(outputPath, m_chunks, m_maxLODLevels, deadbandMeters, m_state.splatRadius, m_occlusionVoxels, m_sourceFileBytes, &m_occlusionMips, &m_detailGrid))
         {
             std::ifstream pkg(outputPath + ".sflw", std::ios::ate | std::ios::binary);
             if (pkg.is_open())
@@ -3849,6 +3870,13 @@ namespace Surfels
 
                     const char* schemes[] = { "Turbo (Classic Rainbow)", "Viridis (Perceptual)", "Plasma (Magma)" };
                     ImGui::Checkbox("Show Density Heatmap Cluster Cubes", &m_showClusterHeatmap);
+                    {
+                        const char* sources[] = { "Point Density", "Detail (Stream Order)" };
+                        if (ImGui::Combo("Heatmap Source", &m_heatmapSource, sources, IM_ARRAYSIZE(sources)))
+                        {
+                            RebuildHeatmapClusterCubes();
+                        }
+                    }
                     if (m_showClusterHeatmap)
                     {
                         ImGui::SliderFloat("Cube Fill Opacity", &m_heatmapOpacity, 0.0f, 1.0f, "%.2f");
@@ -3897,7 +3925,7 @@ namespace Surfels
                         m_isStreamingPaused ? "[PAUSED]" : "[STREAMING]");
 
                     ImGui::Checkbox("Prioritize View Frustum & Proximity", &m_prioritizeFrustumAndProximity);
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Streams the coarsest base LOD first, followed by high-detail chunks in the current camera frustum and near the viewer.");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("On: within the detail ordering, blocks inside the view frustum are delivered before those outside it (then the neighbour band, then the rest), with view-centre and proximity breaking near-ties. Off: the pure detail ranking, model-wide, regardless of the camera.");
 
                     // Bandwidth Preset Buttons
                     ImGui::Text("Network Profiles:");
@@ -4729,7 +4757,7 @@ namespace Surfels
         if (m_showOcclusionVolumeOnly)     add(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), "[View Occlusion Volume Only Mode Enabled]");
         if (m_showOnlyLockedChunks)        add(ImVec4(1.00f, 0.60f, 0.20f, 1.0f), "[Show ONLY Locked Chunks Mode Enabled]");
         if (m_highlightSilhouetteChunks)   add(ImVec4(0.78f, 0.68f, 1.00f, 1.0f), "[Highlight Edge Chunks Mode Enabled]");
-        if (m_showClusterHeatmap)          add(ImVec4(1.00f, 0.45f, 0.35f, 1.0f), "[Density Heatmap Cluster Cubes Mode Enabled]");
+        if (m_showClusterHeatmap)          add(ImVec4(1.00f, 0.45f, 0.35f, 1.0f), m_heatmapSource == 1 ? "[Detail Heatmap Cluster Cubes Mode Enabled]" : "[Density Heatmap Cluster Cubes Mode Enabled]");
         if (m_showHeatmapWireframe)        add(ImVec4(0.92f, 0.82f, 0.60f, 1.0f), "[Cube Outlines Mode Enabled]");
         if (m_showOctreeVisualizer)        add(ImVec4(1.00f, 0.75f, 0.20f, 1.0f), "[Macro Clusters Mode Enabled]");
         if (m_showGlobalBounds)            add(ImVec4(0.40f, 0.60f, 1.00f, 1.0f), "[Global Model Bounds Mode Enabled]");
@@ -5035,7 +5063,12 @@ namespace Surfels
 
         for (auto& cube : m_heatmapClusterCubes)
         {
-            if (cube.pointCount > 0)
+            if (cube.pointCount > 0 && m_heatmapSource == 1)
+            {
+                // Detail source: the streaming order itself (mean detail score over the cube's cells)
+                cube.normDensity = m_detailGrid.Valid() ? m_detailGrid.SampleBox(cube.aabbMin, cube.aabbMax) : 0.0f;
+            }
+            else if (cube.pointCount > 0)
             {
                 float logD = std::log(std::max(1.0f, cube.density));
                 cube.normDensity = std::max(0.0f, std::min(1.0f, (logD - logMin) / logRange));

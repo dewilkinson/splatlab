@@ -2374,11 +2374,22 @@ namespace Surfels
         m_rendererMeshletChunks.clear();
         m_rendererSourceChunks.clear();
 
-        // Reset transition lock flags across all chunks before traversal
+        // Reset transition lock flags across all chunks before traversal. Also release the edge flag on
+        // every chunk that was NOT in the previous frame's render list: the GPU silhouette bitmask is
+        // ingested for rendered chunks only, so a chunk flagged while it was drawn (e.g. a fine level
+        // passing through a zoom-out transition) kept its flag indefinitely once it dropped out of the
+        // list -- the residency graph then showed whole levels as Silhouette Lock, and the streaming
+        // logic kept treating them as edges. A chunk that is not being rendered cannot be an edge.
         for (auto& lodList : m_lodStreamChunks)
         {
             for (auto& c : lodList)
             {
+                if (!c.renderedLastFrame)
+                {
+                    c.isSilhouette = false;
+                    c.silhouetteHysteresisTimer = 0.0f;
+                }
+                c.renderedLastFrame = false; // Re-armed below by AppendChunkToRenderer for this frame's list
                 c.isLockedInTransition = false;
             }
         }
@@ -2419,6 +2430,7 @@ namespace Surfels
             chunkGpu.isSilhouette = waveIntensity;
             m_rendererMeshletChunks.push_back(chunkGpu);
             m_rendererSourceChunks.push_back(pChunk);
+            pChunk->renderedLastFrame = true;
         };
 
         // Recursively evicts every still-resident descendant of (lvl, cIdx) below it. TraverseNode only

@@ -1790,97 +1790,32 @@ namespace Surfels
             }
             else
             {
-                chunk.isRequested = false;
+                // Queue full. The traversal posts its child requests in chunk-index order, thousands per
+                // frame, so simply dropping the overflow meant the first ~1024 by INDEX were the only
+                // candidates and every level filled left-to-right regardless of the priority ranking.
+                // The pending range is re-sorted descending every frame, so its tail is (close to) the
+                // lowest-priority entry: displace it when the newcomer outranks it. Over a few frames the
+                ChunkRequest& tail = m_demandRequestQueue.back();
+                if (priority > tail.priority)
+                {
+                    if (tail.lodLevel >= 0 && tail.lodLevel < (int)m_lodStreamChunks.size() && tail.chunkIndex < m_lodStreamChunks[tail.lodLevel].size())
+                    {
+                        m_lodStreamChunks[tail.lodLevel][tail.chunkIndex].isRequested = false;
+                    }
+                    tail = { lodLevel, chunkIndex, priority };
+                    chunk.isRequested = true;
+                    chunk.currentPriority = priority;
+                }
+                else
+                {
+                    chunk.isRequested = false;
+                }
             }
         }
         else
         {
             chunk.currentPriority = std::max(chunk.currentPriority, priority);
         }
-    }
-
-    // Automated self-test: walks every LOD level checking for buffer overruns, NaN/Inf positions, and dither coverage gaps
-    void PreprocessApp::RunMemoryAndLODIntegrityTest()
-    {
-        std::stringstream ss;
-        int numLODs = (int)m_lodStreamChunks.size();
-        if (numLODs == 0)
-        {
-            m_integrityReport = "[ERROR] No LOD dataset loaded to test.";
-            return;
-        }
-
-        size_t totalChunksTested = 0;
-        size_t totalSurfelsTested = 0;
-        size_t outOfBoundsOffsetErrors = 0;
-        size_t nanCoordErrors = 0;
-        size_t boundsViolationErrors = 0;
-        size_t emptyChunkErrors = 0;
-
-        size_t rawBufferSize = m_unifiedRawSurfels.size();
-        size_t packedBufferSize = m_unifiedPackedSurfels.size();
-
-        for (int lvl = 0; lvl < numLODs; lvl++)
-        {
-            size_t lvlChunks = m_lodStreamChunks[lvl].size();
-            totalChunksTested += lvlChunks;
-
-            for (size_t c = 0; c < lvlChunks; c++)
-            {
-                const auto& chunk = m_lodStreamChunks[lvl][c];
-                size_t count = chunk.rawSurfels.size();
-                totalSurfelsTested += count;
-
-                if (count == 0) emptyChunkErrors++;
-
-                // 1. Buffer range & offset validation
-                if (chunk.globalSurfelOffset + count > rawBufferSize)
-                {
-                    outOfBoundsOffsetErrors++;
-                }
-                if (!m_unifiedPackedSurfels.empty() && chunk.globalSurfelOffset + count > packedBufferSize)
-                {
-                    outOfBoundsOffsetErrors++;
-                }
-
-                // 2. Numerical Sanity & AABB Coverage Validation
-                for (const auto& s : chunk.rawSurfels)
-                {
-                    if (std::isnan(s.position.x) || std::isnan(s.position.y) || std::isnan(s.position.z) ||
-                        std::isinf(s.position.x) || std::isinf(s.position.y) || std::isinf(s.position.z))
-                    {
-                        nanCoordErrors++;
-                    }
-
-                    if (s.position.x < m_aabbMin.x - 0.05f || s.position.x > m_aabbMax.x + 0.05f ||
-                        s.position.y < m_aabbMin.y - 0.05f || s.position.y > m_aabbMax.y + 0.05f ||
-                        s.position.z < m_aabbMin.z - 0.05f || s.position.z > m_aabbMax.z + 0.05f)
-                    {
-                        boundsViolationErrors++;
-                    }
-                }
-            }
-        }
-
-        if (outOfBoundsOffsetErrors == 0 && nanCoordErrors == 0 && boundsViolationErrors == 0 && emptyChunkErrors == 0)
-        {
-            ss << "[PASS] 100% Data & Memory Integrity Validated!\n"
-               << "  - LOD Levels: " << numLODs << "\n"
-               << "  - Total Chunks Tested: " << totalChunksTested << "\n"
-               << "  - Total Multi-Res Surfels: " << totalSurfelsTested << "\n"
-               << "  - VRAM Layout: 0 Buffer Overruns, 0 NaN/Inf Points, 0 AABB Leaks\n"
-               << "  - Dither Coverage: 100% Screen-Space Complementary Sum Verified.";
-        }
-        else
-        {
-            ss << "[FAIL] Integrity Issues Found:\n"
-               << "  - Offset Overruns: " << outOfBoundsOffsetErrors << "\n"
-               << "  - NaN/Inf Points: " << nanCoordErrors << "\n"
-               << "  - AABB Violations: " << boundsViolationErrors << "\n"
-               << "  - Empty Chunks: " << emptyChunkErrors;
-        }
-
-        m_integrityReport = ss.str();
     }
 
     // Debug helper that forces a full silhouette-edge refinement cycle, to visually verify the dither morph
@@ -2277,7 +2212,7 @@ namespace Surfels
                     chunk.isResident = true;
                     chunk.isDelivered = true;
                     chunk.isRequested = false;
-                    chunk.streamWaveTimer = chunk.isSilhouette ? 0.0f : m_chunkStreamDuration;
+                    chunk.streamWaveTimer = m_chunkStreamDuration; // Arrival glow (Show Streaming Arrivals); edge chunks included
                     m_simulatedBytesDelivered += cBytes;
                     currentResidentBytes += cBytes;
                     budget -= cBytes;
@@ -2396,11 +2331,13 @@ namespace Surfels
         m_rendererSourceChunks.clear();
 
         // Reset transition lock flags across all chunks before traversal. Also release the edge flag on
-        // every chunk that was NOT in the previous frame's render list: the GPU silhouette bitmask is
+        // every chunk the previous frame's traversal never visited: the GPU silhouette bitmask is
         // ingested for rendered chunks only, so a chunk flagged while it was drawn (e.g. a fine level
-        // passing through a zoom-out transition) kept its flag indefinitely once it dropped out of the
-        // list -- the residency graph then showed whole levels as Silhouette Lock, and the streaming
-        // logic kept treating them as edges. A chunk that is not being rendered cannot be an edge.
+        // passing through a zoom-out transition) kept its flag indefinitely once its level dropped out
+        // of use -- the residency graph then showed whole levels as Silhouette Lock, and the streaming
+        // logic kept treating them as edges. "Visited" (not merely "rendered") is the right test: an
+        // edge parent that the traversal refines into its children is not rendered itself but must
+        // keep its flag, or it would re-render, be re-detected and refine again every other frame.
         for (auto& lodList : m_lodStreamChunks)
         {
             for (auto& c : lodList)
@@ -2427,13 +2364,17 @@ namespace Surfels
 
             bool isSilChunk = isSil || pChunk->isSilhouette;
 
-            // Show Chunk Stream & Edge Highlighting: 1.0 (Lavender Edge), 0.95..0.0 (Orange Wave Sweep)
+            // Edge highlight & streaming arrival glow, packed into one float for the shader: exactly 1.0 = edge
+            // chunk (lavender when Highlight Edge Chunks is on), 0.95..0 = arrival glow age (0.95 = just
+            // delivered, 0 = faded). An edge chunk that has just arrived shows the glow unless the edge
+            // highlight is on, in which case lavender wins.
             float waveIntensity = 0.0f;
-            if (isSilChunk)
+            const bool arrivalGlow = m_showChunkStream && pChunk->streamWaveTimer > 0.0f && m_chunkStreamDuration > 0.0f;
+            if (isSilChunk && (m_highlightSilhouetteChunks || !arrivalGlow))
             {
                 waveIntensity = 1.0f;
             }
-            else if (m_showChunkStream && pChunk->streamWaveTimer > 0.0f && m_chunkStreamDuration > 0.0f)
+            else if (arrivalGlow)
             {
                 waveIntensity = std::min(0.95f, pChunk->streamWaveTimer / m_chunkStreamDuration);
             }
@@ -2515,6 +2456,10 @@ namespace Surfels
                 return;
 
             auto& currentChunk = m_lodStreamChunks[lvl][cIdx];
+            // Visited by this frame's traversal: it will either be rendered or refined into its children
+            // below. Either way it is part of the active hierarchy and its edge flag stays live (see the
+            // reset loop before traversal, which clears the flag on anything not visited).
+            currentChunk.renderedLastFrame = true;
 
             bool inNeighborScope = IsSphereInNeighborFrustum(currentChunk.center, currentChunk.radius);
 
@@ -3602,6 +3547,19 @@ namespace Surfels
                     }
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Visualizer toggle: highlights the active silhouette edge chunks.");
 
+                    if (ImGui::Checkbox("Show Streaming Arrivals (Orange Glow)", &m_showChunkStream))
+                    {
+                        m_streamStateDirty = true;
+                    }
+                    if (m_showChunkStream)
+                    {
+                        ImGui::SameLine();
+                        ImGui::PushItemWidth(100.0f);
+                        ImGui::SliderFloat("##ArrivalFade", &m_chunkStreamDuration, 0.5f, 10.0f, "%.1f s");
+                        ImGui::PopItemWidth();
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("How long a delivered chunk stays tinted. The bright glow occupies roughly the first third; the tint fades out at the end.");
+                    }
+
                     if (ImGui::Checkbox("Show ONLY Locked Chunks (Transition / Edge)", &m_showOnlyLockedChunks))
                     {
                         m_streamStateDirty = true;
@@ -3672,18 +3630,6 @@ namespace Surfels
                         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Unloads and immediately refreshes ONLY the silhouette edge chunks without touching or waving the rest of the model.");
                     }
 
-                    ImGui::Separator();
-                    if (ImGui::Button("Validate Buffer & LOD Integrity", ImVec2(-1, 26)))
-                    {
-                        RunMemoryAndLODIntegrityTest();
-                    }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Runs automated deep diagnostics across all LOD levels: checks for buffer overruns, NaN/Inf positions, AABB leaks, and verifies 100% complementary dither coverage.");
-
-                    if (!m_integrityReport.empty())
-                    {
-                        bool isPass = (m_integrityReport.find("[PASS]") != std::string::npos);
-                        ImGui::TextColored(isPass ? ImVec4(0.3f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", m_integrityReport.c_str());
-                    }
                 }
 
                 // Interior Occlusion Volume (viewer controls) -- only relevant when the loaded model
@@ -4757,6 +4703,7 @@ namespace Surfels
         if (m_showOcclusionVolumeOnly)     add(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), "[View Occlusion Volume Only Mode Enabled]");
         if (m_showOnlyLockedChunks)        add(ImVec4(1.00f, 0.60f, 0.20f, 1.0f), "[Show ONLY Locked Chunks Mode Enabled]");
         if (m_highlightSilhouetteChunks)   add(ImVec4(0.78f, 0.68f, 1.00f, 1.0f), "[Highlight Edge Chunks Mode Enabled]");
+        if (m_showChunkStream)             add(ImVec4(1.00f, 0.62f, 0.20f, 1.0f), "[Streaming Arrival Glow Mode Enabled]");
         if (m_showClusterHeatmap)          add(ImVec4(1.00f, 0.45f, 0.35f, 1.0f), m_heatmapSource == 1 ? "[Detail Heatmap Cluster Cubes Mode Enabled]" : "[Density Heatmap Cluster Cubes Mode Enabled]");
         if (m_showHeatmapWireframe)        add(ImVec4(0.92f, 0.82f, 0.60f, 1.0f), "[Cube Outlines Mode Enabled]");
         if (m_showOctreeVisualizer)        add(ImVec4(1.00f, 0.75f, 0.20f, 1.0f), "[Macro Clusters Mode Enabled]");

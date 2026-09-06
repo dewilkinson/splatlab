@@ -1492,7 +1492,7 @@ namespace Surfels
         m_allStreamChunkPtrs.clear();
         m_rendererMeshletChunks.clear();
         m_rendererSourceChunks.clear();
-        m_demandRequestQueue.clear();
+        m_demandRequestQueue.clear(); ClearFaceEdgeQueues();
         m_demandRequestHead = 0;
         m_smoothedLodResidentPct.clear();
         m_smoothedLodResidentBlocks.clear();
@@ -1638,7 +1638,7 @@ namespace Surfels
             m_simulatedBytesDelivered = 0.0f;
             m_streamRefinementProgress = 0.0f;
             m_evictedSurfelCount = 0;
-            m_demandRequestQueue.clear();
+            m_demandRequestQueue.clear(); ClearFaceEdgeQueues();
             m_demandRequestHead = 0;
             return;
         }
@@ -1687,7 +1687,7 @@ namespace Surfels
             if (lvl < (int)m_smoothedLodResidentBlocks.size()) m_smoothedLodResidentBlocks[lvl] = 20;
         }
 
-        m_demandRequestQueue.clear();
+        m_demandRequestQueue.clear(); ClearFaceEdgeQueues();
         m_demandRequestHead = 0;
 
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
@@ -1710,7 +1710,7 @@ namespace Surfels
             m_simulatedBytesDelivered = 0.0f;
             m_streamRefinementProgress = 0.0f;
             m_evictedSurfelCount = 0;
-            m_demandRequestQueue.clear();
+            m_demandRequestQueue.clear(); ClearFaceEdgeQueues();
             m_demandRequestHead = 0;
             return;
         }
@@ -1762,7 +1762,7 @@ namespace Surfels
             }
         }
 
-        m_demandRequestQueue.clear();
+        m_demandRequestQueue.clear(); ClearFaceEdgeQueues();
         m_demandRequestHead = 0;
 
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
@@ -1794,6 +1794,27 @@ namespace Surfels
         auto& chunk = m_lodStreamChunks[lodLevel][chunkIndex];
         if (chunk.isResident)
             return;
+        chunk.lastRequestFrame = m_streamFrame;
+
+        // TIER 1 (silhouette edges, bootstrap envelope): straight into the block's octahedron face queue,
+        // uncapped by the 1024-entry demand window, so the delivery simulator can deal the edge tier out
+        // across the faces. A block already waiting in the demand queue that has since become an edge is
+        // queued here as well; whichever entry lands first delivers it and the other is dropped as stale.
+        if (priority >= 100000000.0f)
+        {
+            if (!chunk.isEdgeQueued)
+            {
+                const int face = chunk.octahedronFace & (kOctahedronFaces - 1);
+                if (m_faceEdgeQueue[face].size() - m_faceEdgeHead[face] < kMaxEdgeQueuePerFace)
+                {
+                    m_faceEdgeQueue[face].push_back({ lodLevel, chunkIndex, priority });
+                    chunk.isEdgeQueued = true;
+                    chunk.isRequested = true;
+                    chunk.currentPriority = std::max(chunk.currentPriority, priority);
+                }
+            }
+            return;
+        }
 
         if (!chunk.isRequested)
         {
@@ -1901,6 +1922,7 @@ namespace Surfels
     // based on bandwidth throttle, decay rate, camera position, and the current priority queue.
     void PreprocessApp::UpdateStreamingSimulation(double dtSeconds)
     {
+        m_streamFrame++;
         if (m_morphTestDebounceTimer > 0.0f)
         {
             m_morphTestDebounceTimer = std::max(0.0f, m_morphTestDebounceTimer - (float)dtSeconds);
@@ -2235,13 +2257,19 @@ namespace Surfels
                 return true;
             };
             // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
-            // 1. Edge chunks and the coarse bootstrap envelope (TIER 1 and above) always land first.
-            for (StreamChunk* pChunk : m_scratchLoadList)
+            // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+            // 1. Edge chunks and the coarse bootstrap envelope (TIER 1 and above) always land first,
+            //    dealt out across the octahedron faces from their own per-face queues.
+            if (canDeliver)
             {
-                if (budget <= 0.0f) break;
-                if (!deliverChunk(*pChunk)) break;
+                for (StreamChunk* pChunk : m_scratchLoadList)
+                {
+                    if (budget <= 0.0f) break;
+                    if (!deliverChunk(*pChunk)) { canDeliver = false; break; }
+                }
             }
-            // 3. Whatever else the view asked for (out-of-face stragglers, Conservative-mode demands).
+            // 3. Whatever else the view asked for (out-of-face stragglers, Conservative-mode demands),
+            //    again dealt out across the faces.
 
             // Cleanup processed head
             if (m_demandRequestHead > 256 || m_demandRequestHead >= m_demandRequestQueue.size())
@@ -2658,7 +2686,9 @@ namespace Surfels
                     auto& c = m_lodStreamChunks[finerLvl][ci];
                     c.isLockedInTransition = false;
 
-                    // In Conservative mode: evict non-silhouette Level N-1 child chunks upon demotion completion.
+                    // In Conservative mode: evict non-silhouette Level N-1 child chunks upon demotion completion --
+                    // but only if this node had actually refined into them (hasRefined). Children that arrived
+                    // shown are kept: evicting them here would just make the face streams re-deliver them.
                     // In Greedy mode, only evict if THIS chunk was explicitly decay-marked (c.isEvictionPending,
                     // set by the LRU decay pass above) -- otherwise Greedy's normal "keep it cached, don't
                     // thrash" behavior is preserved. Without the isEvictionPending clause, decay had no effect
@@ -2667,7 +2697,7 @@ namespace Surfels
                     // forever -- resident memory was never actually reclaimed no matter how high the decay
                     // rate or how low the bandwidth throttle was set.
                     // (Never evict highest two mip levels: coarsestLvl and coarsestLvl - 1)
-                    if ((m_streamingPolicy == StreamingPolicy::Conservative || c.isEvictionPending) && (!c.isSilhouette || anyChildEvictionPending))
+                    if (((m_streamingPolicy == StreamingPolicy::Conservative && currentChunk.hasRefined) || c.isEvictionPending) && (!c.isSilhouette || anyChildEvictionPending))
                     {
                         if (finerLvl < coarsestLvl - 1)
                         {
@@ -2689,6 +2719,7 @@ namespace Surfels
                     }
                 }
 
+
                 // Render current parent chunk as 100% solid
                 AppendChunkToRenderer(&currentChunk, parentFactor, isSilhouette);
                 return;
@@ -2699,6 +2730,7 @@ namespace Surfels
             // =========================================================================
             if (allChildrenResident && currentChunk.isResident)
             {
+                currentChunk.hasRefined = true; // Children are being shown: dropping back to this node later evicts them (CASE 1)
                 currentChunk.transitionProgress = std::min(1.0f, currentChunk.transitionProgress + progressStep);
                 float t = m_enableDitheredTransitions ? currentChunk.transitionProgress : 1.0f;
 
@@ -4675,7 +4707,6 @@ namespace Surfels
         }
         if (ImGui::IsItemHovered())
         {
-            ImGui::SetTooltip("Conservative Mode: Streams only visible chunks + local neighbor buffer.\nStreaming pauses once the active view is satisfied until camera moves.");
         }
         ImGui::SameLine();
         if (ImGui::RadioButton("Greedy##Eq", &policyRadio2, 1))
@@ -4717,6 +4748,21 @@ namespace Surfels
     // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
 
     // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+
+    void PreprocessApp::ClearFaceEdgeQueues()
+    {
+        for (int f = 0; f < kOctahedronFaces; f++)
+        {
+            for (size_t i = m_faceEdgeHead[f]; i < m_faceEdgeQueue[f].size(); i++)
+            {
+                const ChunkRequest& req = m_faceEdgeQueue[f][i];
+                if (req.lodLevel >= 0 && req.lodLevel < (int)m_lodStreamChunks.size() && req.chunkIndex < m_lodStreamChunks[req.lodLevel].size())
+                    m_lodStreamChunks[req.lodLevel][req.chunkIndex].isEdgeQueued = false;
+            }
+            m_faceEdgeQueue[f].clear();
+            m_faceEdgeHead[f] = 0;
+        }
+    }
 
     // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
 
@@ -4787,12 +4833,12 @@ namespace Surfels
         ImGui::Dummy(ImVec2(2.0f * cell + 14.0f, cell));
         if (ImGui::IsItemHovered())
         {
-            std::string tip = "Left (green): the four upper faces (+Y), right (blue): the four lower faces (-Y), both seen from above with +X right and +Z down.\nYellow dot = camera direction; inner triangle = share of the face's blocks resident. Pending / total blocks per face (bits: 1 = +X, 2 = +Y, 4 = +Z):";
+            std::string tip = "Left (green): the four upper faces (+Y), right (blue): the four lower faces (-Y), both seen from above with +X right and +Z down.\nYellow dot = camera direction; inner triangle = share of the face's blocks resident. Pending / total blocks per face, and queued edge requests (bits: 1 = +X, 2 = +Y, 4 = +Z):";
             for (int f = 0; f < kOctahedronFaces; f++)
             {
                 char b[96];
-                snprintf(b, sizeof(b), "\n  face %d (%c%c%c): %u / %u %s", f, (f & 1) ? '+' : '-', (f & 2) ? '+' : '-', (f & 4) ? '+' : '-',
-                    m_faceRemaining[f], m_faceTotal[f], (m_visibleFaceMask & (1u << f)) ? "(visible)" : "");
+                snprintf(b, sizeof(b), "\n  face %d (%c%c%c): %u / %u, %zu edge requests %s", f, (f & 1) ? '+' : '-', (f & 2) ? '+' : '-', (f & 4) ? '+' : '-',
+                    m_faceRemaining[f], m_faceTotal[f], m_faceEdgeQueue[f].size() - m_faceEdgeHead[f], (m_visibleFaceMask & (1u << f)) ? "(visible)" : "");
                 tip += b;
             }
             ImGui::SetTooltip("%s", tip.c_str());

@@ -8,6 +8,7 @@
 
 #include "PreprocessApp.h"
 #include <chrono>
+#include <cfloat>
 #include "../../libs/bluesec-codec/OcclusionVolume.h"
 #include <DirectXCollision.h>
 #include <iomanip>
@@ -1637,6 +1638,7 @@ namespace Surfels
         }
 
         // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+        ComputeLodSpacing();
 
         // Default the ring buffer to its slider ceiling for this dataset (the whole stream fits with room
         // to spare); the Renderer tab's GPU Ring Buffer Size slider can then be pulled down to simulate a
@@ -2203,6 +2205,7 @@ namespace Surfels
         // multiplex their priority lists into this frame's scratch load list. The delivery simulator
         // below consumes it right after the edge chunks, so every visible face grows at once, most
         // detailed regions first, and faces the camera cannot see wait until they come into view.
+        if ((m_streamFrame % 60u) == 0u) HealStaleRequestFlags();
         m_scratchLoadList.clear();
         if (!m_enableStreamDecay)
         {
@@ -2263,7 +2266,8 @@ namespace Surfels
             // the ring buffer is full (nothing more can land this frame).
             auto deliverChunk = [&](StreamChunk& chunk) -> bool
             {
-                if (chunk.isResident || chunk.isEvictionPending) return true;
+                if (chunk.isResident) return true;
+                chunk.isEvictionPending = false; // Not resident: an eviction flag left on it is stale and must not block delivery
                 float cBytes = (float)chunk.byteSize;
                 if (currentResidentBytes + cBytes > maxResidentBytes)
                 {
@@ -3783,6 +3787,24 @@ namespace Surfels
                         m_state.orientMode = (uint32_t)orientIdx;
                     }
                     ImGui::SliderFloat("Splat Radius Scale", &m_state.splatRadius, 0.10f, 10.0f, "%.2fx");
+                    ImGui::Checkbox("Auto Splat Size (per-level density)", &m_autoSplatSize);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Sizes every disc from its level's typical point spacing instead of the per-point size classes: a dense patch covers the surface exactly and an isolated point (scan outlier, decimation stray) gets the same small disc instead of an inflated one, which removes the halo of ghost discs around the model at coarse levels. Splat Radius Scale still multiplies.");
+                    if (m_autoSplatSize)
+                    {
+                        ImGui::Indent(12.0f);
+                        ImGui::PushItemWidth(150.0f);
+                        ImGui::SliderFloat("Coverage", &m_autoSplatCoverage, 0.0f, 8.0f, "%.2f x spacing");
+                        ImGui::PopItemWidth();
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Disc radius as a multiple of the level's point spacing. Around 1.0 neighbouring discs just cover the surface; below ~0.6 gaps open, well above 1 discs overlap heavily and strays grow again. Splats that project below about 1.5 pixels are drawn as opaque one-pixel dots regardless.");
+                        if (!m_lodSpacing.empty())
+                        {
+                            std::string sp = "Level spacing:";
+                            for (size_t l = 0; l < m_lodSpacing.size(); l++) { char b[40]; snprintf(b, sizeof(b), " L%zu %.4g", l, m_lodSpacing[l]); sp += b; }
+                            ImGui::TextDisabled("%s", sp.c_str());
+                            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Median nearest-neighbour distance of each level's points, in model units (measured on load).");
+                        }
+                        ImGui::Unindent(12.0f);
+                    }
                     ImGui::Separator();
 
                     ImGui::Checkbox("Auto Rotate Model##Viewport", &m_autoRotate);
@@ -4867,9 +4889,108 @@ namespace Surfels
         ImGui::Unindent(12.0f);
     }
 
+    // Typical point spacing per LOD level: the median distance from a point to its nearest neighbour,
+    // measured on a sample of up to 60k points per level against all of that level's points through a
+    // sorted grid. Drives Auto Splat Size (disc radius = spacing x coverage), so coarse levels no longer
+    // inflate every disc by a fixed class factor -- the inflation is what turned isolated points into the
+    // halo of ghost discs around the model.
+    void PreprocessApp::ComputeLodSpacing()
+    {
+        const int numLODs = (int)m_lodStreamChunks.size();
+        m_lodSpacing.assign(numLODs, 0.0f);
+        const float ex = std::max(1e-6f, m_aabbMax.x - m_aabbMin.x), ey = std::max(1e-6f, m_aabbMax.y - m_aabbMin.y), ez = std::max(1e-6f, m_aabbMax.z - m_aabbMin.z);
+        for (int lvl = 0; lvl < numLODs; lvl++)
+        {
+            size_t total = 0;
+            for (const auto& c : m_lodStreamChunks[lvl]) total += c.rawSurfels.size();
+            if (total < 8) continue;
+            std::vector<XMFLOAT3> pts; pts.reserve(total);
+            for (const auto& c : m_lodStreamChunks[lvl]) for (const auto& v : c.rawSurfels) pts.push_back(v.position);
+
+            // Cell size: a surface's points spread over roughly (extent^2) area, so the expected spacing
+            // is about sqrt(area / n); three of those per cell keeps the 27-cell neighbourhood small.
+            const float area = 2.0f * (ex * ey + ey * ez + ez * ex);
+            const float cell = std::max(1e-5f, sqrtf(area / (float)total) * 3.0f);
+            auto cellKey = [&](int ix, int iy, int iz) -> uint64_t
+            {
+                return ((uint64_t)(uint32_t)(ix + 0x100000) << 42) | ((uint64_t)(uint32_t)(iy + 0x100000) << 21) | (uint64_t)(uint32_t)(iz + 0x100000);
+            };
+            auto cellOf = [&](const XMFLOAT3& p, int& ix, int& iy, int& iz)
+            {
+                ix = (int)floorf((p.x - m_aabbMin.x) / cell); iy = (int)floorf((p.y - m_aabbMin.y) / cell); iz = (int)floorf((p.z - m_aabbMin.z) / cell);
+            };
+            std::vector<std::pair<uint64_t, uint32_t>> grid; grid.reserve(total);
+            for (uint32_t i = 0; i < (uint32_t)total; i++)
+            {
+                int ix, iy, iz; cellOf(pts[i], ix, iy, iz);
+                grid.emplace_back(cellKey(ix, iy, iz), i);
+            }
+            std::sort(grid.begin(), grid.end());
+
+            const size_t samples = std::min<size_t>(total, 60000);
+            const size_t stride = std::max<size_t>(1, total / samples);
+            std::vector<float> dists; dists.reserve(samples);
+            for (size_t si = 0; si < total; si += stride)
+            {
+                const XMFLOAT3& p = pts[si];
+                int ix, iy, iz; cellOf(p, ix, iy, iz);
+                float best = FLT_MAX;
+                for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++)
+                {
+                    const uint64_t k = cellKey(ix + dx, iy + dy, iz + dz);
+                    auto it = std::lower_bound(grid.begin(), grid.end(), std::make_pair(k, 0u));
+                    for (; it != grid.end() && it->first == k; ++it)
+                    {
+                        if (it->second == si) continue;
+                        const XMFLOAT3& q = pts[it->second];
+                        const float d2 = (q.x - p.x) * (q.x - p.x) + (q.y - p.y) * (q.y - p.y) + (q.z - p.z) * (q.z - p.z);
+                        if (d2 < best) best = d2;
+                    }
+                }
+                if (best < FLT_MAX) dists.push_back(sqrtf(best));
+            }
+            if (dists.empty()) continue;
+            std::nth_element(dists.begin(), dists.begin() + dists.size() / 2, dists.end());
+            m_lodSpacing[lvl] = dists[dists.size() / 2];
+            LogTransitionTrace("ComputeLodSpacing: LOD %d: %zu points, %zu sampled, median nearest-neighbour %.5f (cell %.5f)", lvl, total, dists.size(), m_lodSpacing[lvl], cell);
+        }
+    }
+
     // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
 
     // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
+
+    // A block whose isRequested flag is set is never requested again by the traversal, so if its entry
+    // is ever lost -- dropped from a queue on a reset, displaced, or dead-ended by a stale flag -- it
+    // would never arrive and its parent would never refine: a permanent hole in the model. Rather than
+    // trusting every path to keep the flag and the queues in step, this sweep (once a second) clears
+    // the flag on every non-resident block that neither queue holds, and clears an eviction flag on any
+    // non-resident block, so the next traversal simply asks again.
+    void PreprocessApp::HealStaleRequestFlags()
+    {
+        // Which blocks the normal queue still holds (its pending range is at most 1024 entries).
+        std::vector<std::pair<int, size_t>> queued;
+        queued.reserve(m_demandRequestQueue.size() > m_demandRequestHead ? m_demandRequestQueue.size() - m_demandRequestHead : 0);
+        for (size_t i = m_demandRequestHead; i < m_demandRequestQueue.size(); i++)
+            queued.emplace_back(m_demandRequestQueue[i].lodLevel, m_demandRequestQueue[i].chunkIndex);
+        std::sort(queued.begin(), queued.end());
+        uint32_t healed = 0;
+        for (int lvl = 0; lvl < (int)m_lodStreamChunks.size(); lvl++)
+        {
+            for (size_t ci = 0; ci < m_lodStreamChunks[lvl].size(); ci++)
+            {
+                StreamChunk& c = m_lodStreamChunks[lvl][ci];
+                if (c.isResident) continue;
+                if (c.isEvictionPending) { c.isEvictionPending = false; healed++; }
+                if (c.isRequested && !c.isEdgeQueued && !std::binary_search(queued.begin(), queued.end(), std::make_pair(lvl, ci)))
+                {
+                    c.isRequested = false;
+                    healed++;
+                }
+            }
+        }
+        if (healed > 0) LogTransitionTrace("HealStaleRequestFlags: cleared %u stale flags", healed);
+    }
 
     void PreprocessApp::ClearFaceEdgeQueues()
     {
@@ -6031,6 +6152,8 @@ namespace Surfels
         m_state.showChunkStream = m_showChunkStream;
         m_state.arrivalGlowIntensity = m_arrivalGlowIntensity;
         m_state.arrivalGlowHue = m_arrivalGlowHue;
+        m_state.autoSplatSize = m_autoSplatSize;
+        for (int l = 0; l < 8; l++) m_state.lodRadius[l] = (l < (int)m_lodSpacing.size()) ? m_lodSpacing[l] * m_autoSplatCoverage : 0.0f;
         m_state.enableGpuSilhouetteInversion = m_enableSilhouetteLOD0 || m_highlightSilhouetteChunks;
         m_state.silhouetteDepthThreshold = m_silhouetteDepthThreshold;
         m_state.enableTemporalFiltering = m_enableTemporalFiltering;

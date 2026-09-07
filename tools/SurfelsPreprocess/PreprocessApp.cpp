@@ -1639,6 +1639,7 @@ namespace Surfels
 
         // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
         ComputeLodSpacing();
+        CalibrateDecay();
 
         // Default the ring buffer to its slider ceiling for this dataset (the whole stream fits with room
         // to spare); the Renderer tab's GPU Ring Buffer Size slider can then be pulled down to simulate a
@@ -2051,19 +2052,10 @@ namespace Surfels
         // time, shown in the slider tooltip.
         if (m_enableStreamDecay && m_streamDecayRate > 0.0f && m_simulatedBytesDelivered > 0.0f)
         {
-            size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
-            float pinnedBytes = 0.0f;
-            if (coarsestLvl >= 0 && coarsestLvl < (int)m_lodTotalSurfels.size())
-            {
-                pinnedBytes += (float)(m_lodTotalSurfels[coarsestLvl] * bytesPerSurfel);
-            }
-            if (coarsestLvl - 1 >= 0 && coarsestLvl - 1 < (int)m_lodTotalSurfels.size())
-            {
-                pinnedBytes += (float)(m_lodTotalSurfels[coarsestLvl - 1] * bytesPerSurfel);
-            }
-            float evictableBytes = std::max(0.0f, m_totalStreamBytes - pinnedBytes);
-            float fullDrainSeconds = DecayFullDrainSeconds();
-            float decayBytes = fullDrainSeconds > 0.0f ? (float)dtSeconds * (evictableBytes / fullDrainSeconds) : 0.0f;
+            // Fixed outflow, calibrated when the toggle / slider last changed (see CalibrateDecay). The
+            // stream keeps refilling at the current bandwidth meanwhile, so the net drain is what the user
+            // dials with the throttle.
+            float decayBytes = (float)dtSeconds * m_decayBytesPerSec;
             int maxEvictableLOD = std::max(0, coarsestLvl - 1); // Protect highest two mip levels
             for (int lvl = 0; lvl < maxEvictableLOD && decayBytes > 0.0f; lvl++)
             {
@@ -2207,7 +2199,8 @@ namespace Surfels
         // detailed regions first, and faces the camera cannot see wait until they come into view.
         if ((m_streamFrame % 60u) == 0u) HealStaleRequestFlags();
         m_scratchLoadList.clear();
-        if (!m_enableStreamDecay)
+        // Runs during decay too: decay is a fixed outflow and the stream is the inflow the user plays
+        // against it with the bandwidth throttle.
         {
             // Only as many candidates as this frame's bandwidth could deliver (plus slack), so a
             // throttled stream does not build thousands of entries a frame it will never touch.
@@ -2360,10 +2353,8 @@ namespace Surfels
         // by the current view could ever actually drain. This makes decay authoritative: with it on, the
         // model gracefully falls back to the pinned coarse envelope via the existing cross-fade/eviction
         // machinery, same as if the camera had moved far enough away to want only those levels.
-        if (m_enableStreamDecay && m_streamDecayRate > 0.0f)
-        {
-            targetLOD = std::max(targetLOD, std::max(0, coarsestLvl - 1));
-        }
+        // (Decay no longer pins the target: it is a fixed outflow that the view's own requests refill
+        // at the current bandwidth, so the bandwidth sets the net eviction rate.)
 
         // Ingest GPU Silhouette Edge Inversion Bitmask (Option 2) from previous frame's rendered chunks
         if (m_pRenderer && (m_highlightSilhouetteChunks || m_enableSilhouetteLOD0))
@@ -4521,6 +4512,36 @@ namespace Surfels
     // Implied time for the decay pass to drain every evictable level at the current slider value.
     // Rate 10 = kDecayFullDrainSecondsAtMaxRate on every bandwidth setting; the time scales inversely
     // with the slider (rate 5 = twice as long). Returns 0 when decay is off or the slider is at 0.
+    float PreprocessApp::EvictableStreamBytes() const
+    {
+        const int numLODs = (int)m_lodTotalSurfels.size();
+        const int coarsestLvl = numLODs - 1;
+        const size_t bytesPerSurfel = m_enableQuantization ? sizeof(PackedSurfelGPU) : sizeof(SurfelVertex);
+        float pinnedBytes = 0.0f;
+        if (coarsestLvl >= 0) pinnedBytes += (float)(m_lodTotalSurfels[coarsestLvl] * bytesPerSurfel);
+        if (coarsestLvl - 1 >= 0) pinnedBytes += (float)(m_lodTotalSurfels[coarsestLvl - 1] * bytesPerSurfel);
+        return std::max(0.0f, m_totalStreamBytes - pinnedBytes);
+    }
+
+    // Sets the decay outflow from the slider and the bandwidth in force right now, and nothing else
+    // touches it until the toggle or slider changes again (or a model loads). Rate 10 = the whole
+    // evictable set drains in kDecayFullDrainSecondsAtMaxRate at this bandwidth: the outflow is that
+    // drain rate plus the reference inflow, so the NET drain at the reference bandwidth takes exactly
+    // that long; with Full (uncapped) as the reference there is no inflow term.
+    void PreprocessApp::CalibrateDecay()
+    {
+        const float drainSeconds = DecayFullDrainSeconds();
+        if (!m_enableStreamDecay || drainSeconds <= 0.0f)
+        {
+            m_decayBytesPerSec = 0.0f;
+            return;
+        }
+        m_decayReferenceBandwidthBps = m_unthrottledBandwidth ? 0.0f : (float)(m_bandwidthThrottleMBps * 1024.0 * 1024.0);
+        m_decayBytesPerSec = EvictableStreamBytes() / drainSeconds + m_decayReferenceBandwidthBps;
+        LogTransitionTrace("CalibrateDecay: rate %.2f -> outflow %.2f MB/s (evictable %.1f MB over %.1f s, reference bandwidth %.2f MB/s)",
+            m_streamDecayRate, m_decayBytesPerSec / (1024.0f * 1024.0f), EvictableStreamBytes() / (1024.0f * 1024.0f), drainSeconds, m_decayReferenceBandwidthBps / (1024.0f * 1024.0f));
+    }
+
     float PreprocessApp::DecayFullDrainSeconds() const
     {
         if (!m_enableStreamDecay || m_streamDecayRate <= 0.0f) return 0.0f;
@@ -4819,11 +4840,21 @@ namespace Surfels
         if (ImGui::SliderFloat("##DecaySlider", &m_streamDecayRate, 0.0f, kMaxDecayRate, "Decay Rate: %.2f"))
         {
             m_streamStateDirty = true;
+            CalibrateDecay();
         }
         if (ImGui::IsItemHovered())
         {
             float drainSeconds = DecayFullDrainSeconds();
-            if (m_streamDecayRate <= 0.0f)
+            if (m_enableStreamDecay && m_streamDecayRate > 0.0f && m_decayBytesPerSec > 0.0f)
+            {
+                const float inflow = m_unthrottledBandwidth ? 0.0f : m_bandwidthThrottleMBps;
+                const float outflowMB = m_decayBytesPerSec / (1024.0f * 1024.0f);
+                char ref[48];
+                if (m_decayReferenceBandwidthBps > 0.0f) snprintf(ref, sizeof(ref), "%.1f MB/s", m_decayReferenceBandwidthBps / (1024.0f * 1024.0f)); else snprintf(ref, sizeof(ref), "Full");
+                ImGui::SetTooltip("Decay outflow %.1f MB/s, fixed when the toggle or slider last changed (reference bandwidth %s: a full drain of every evictable level in ~%.1f s at that bandwidth).\nThe bandwidth throttle is now the knob: current inflow %s, so the net drain is %.1f MB/s.",
+                    outflowMB, ref, drainSeconds, m_unthrottledBandwidth ? "Full (uncapped)" : "", outflowMB - inflow);
+            }
+            else if (m_streamDecayRate <= 0.0f)
                 ImGui::SetTooltip("0 = no decay. Drag right to drain unused detail out of memory.\nIndependent of bandwidth: at 10 it clears everything but the two pinned\ncoarsest levels in %.0f s on any bandwidth setting.", kDecayFullDrainSecondsAtMaxRate);
             else
                 ImGui::SetTooltip("Full drain of all evictable levels in ~%.1f s, on any bandwidth setting.\nAt 10 it clears everything but the two pinned coarsest levels in %.0f s.",
@@ -4834,6 +4865,7 @@ namespace Surfels
         if (ImGui::Checkbox("Decay", &m_enableStreamDecay))
         {
             m_streamStateDirty = true;
+            CalibrateDecay();
         }
         if (ImGui::IsItemHovered())
         {

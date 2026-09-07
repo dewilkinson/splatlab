@@ -7,6 +7,7 @@
 // PreprocessApp.h for the class overview and PreprocessRenderer.cpp for the GPU side.
 
 #include "PreprocessApp.h"
+#include <chrono>
 #include "../../libs/bluesec-codec/OcclusionVolume.h"
 #include <DirectXCollision.h>
 #include <iomanip>
@@ -2286,6 +2287,18 @@ namespace Surfels
             // [Removed from the public history: proprietary streaming-order code, now in libs/bluesec-codec/StreamOrder]
             // 1. Edge chunks and the coarse bootstrap envelope (TIER 1 and above) always land first,
             //    dealt out across the octahedron faces from their own per-face queues.
+            // 2. What the view asks for right now gets a guaranteed share of the frame ahead of the face
+            //    lists. A block that lies in the frustum but belongs to a hidden octahedron face is never in
+            //    any scratch list; it only comes through the demand queue, and with the face lists running
+            //    Conservative mode as large patches that never fade in. The remainder of the queue drains
+            //    after the face lists as before.
+            if (canDeliver)
+            {
+                const float frameBudget = budget;
+                const float reserved = frameBudget * 0.65f;   // Left for the face lists
+                budget = frameBudget - reserved;
+                budget += reserved;                            // Whatever the demand share did not use rolls over
+            }
             if (canDeliver)
             {
                 for (StreamChunk* pChunk : m_scratchLoadList)
@@ -2294,8 +2307,7 @@ namespace Surfels
                     if (!deliverChunk(*pChunk)) { canDeliver = false; break; }
                 }
             }
-            // 3. Whatever else the view asked for (out-of-face stragglers, Conservative-mode demands),
-            //    again dealt out across the faces.
+            // 4. Whatever else the view asked for, again dealt out across the faces.
 
             // Cleanup processed head
             if (m_demandRequestHead > 256 || m_demandRequestHead >= m_demandRequestQueue.size())
@@ -2328,6 +2340,7 @@ namespace Surfels
 
         m_streamRefinementProgress = (m_totalStreamBytes > 0.0f) ? std::min(1.0f, m_simulatedBytesDelivered / m_totalStreamBytes) : 1.0f;
 
+        const auto tTraversalStart = std::chrono::high_resolution_clock::now();
         // 8. Demand-Driven Traversal: Assemble Active Render Workload & Post Child Demands
         int targetLOD = std::max(0, std::min(numLODs - 1, m_selectedPreviewLOD));
 
@@ -2374,11 +2387,9 @@ namespace Surfels
                         {
                             pChunk->isSilhouette = true;
                             pChunk->silhouetteHysteresisTimer = 1.0f;
-                            pChunk->silhouetteAge += (float)dtSeconds;
                         }
                         else
                         {
-                            pChunk->silhouetteAge = 0.0f;
                             if (pChunk->silhouetteHysteresisTimer > 0.0f)
                             {
                                 pChunk->silhouetteHysteresisTimer = std::max(0.0f, pChunk->silhouetteHysteresisTimer - (float)dtSeconds);
@@ -2529,6 +2540,13 @@ namespace Surfels
             : (!m_isStreamingPaused && m_ditherTransitionDurationSec > 0.001f) ? (float)(dtSeconds / m_ditherTransitionDurationSec)
             : (m_isStreamingPaused ? 0.0f : 1.0f);
 
+        // no arrival to wait for, so while the model spins and the edge flags sweep across it, thousands
+        // could begin in one frame -- enough to trip the valve above, which snaps them, and that is the
+        // flash across the visible faces. They are capped per frame instead; the rest try again next
+        // frame. Refinements whose children just arrived are never held: those are paced by the stream.
+        constexpr uint32_t kEdgeRefineStartsPerFrame = 32;
+        m_edgeRefineStartsThisFrame = 0;
+
         std::function<void(int, size_t, float)> TraverseNode = [&](int lvl, size_t cIdx, float parentFactor)
         {
             if (lvl < 0 || lvl >= numLODs || cIdx >= m_lodStreamChunks[lvl].size())
@@ -2580,11 +2598,7 @@ namespace Surfels
             // model while spinning at a forced level, even though nothing should be transitioning at all.
             // Also requires m_enableSilhouetteLOD0 explicitly (not just isSilhouette): isSilhouette can now
             // be true from highlighting alone, which must never trigger the actual refinement behavior.
-            // The edge flag must have held for a moment before it drives refinement below the target level.
-            // With the face lists keeping finer levels resident ahead of need, a refinement is instant, so a
-            // flag that flickers on and off as the model spins would otherwise flash the whole neighbourhood
-            // of the edge in and out of its finer level every frame.
-            bool shouldRefineToLOD0 = m_enableSilhouetteLOD0 && isSilhouette && m_autoLOD && currentChunk.silhouetteAge >= 0.25f;
+            bool shouldRefineToLOD0 = m_enableSilhouetteLOD0 && isSilhouette && m_autoLOD;
             int nodeTargetLOD = shouldRefineToLOD0 ? silTargetLOD : targetLOD;
 
             // In Conservative mode: skip requesting/refining out-of-frustum chunks beyond the neighbor buffer
@@ -2679,7 +2693,11 @@ namespace Surfels
             // First transition back smoothly to Level N parent, locking all 4 children.
             // When transition reaches 0.0 (Parent 100% Solid), atomically evict all 4 children!
             // =========================================================================
-            if (anyChildEvictionPending || lvl <= nodeTargetLOD)
+            // Demotion off (default): a node that has already refined into resident children keeps showing
+            // them when the target coarsens or its edge flag drops; it only demotes for Decay. A node at or
+            // below the target that never refined still renders itself here.
+            const bool keepRefined = !m_demoteChunks && currentChunk.hasRefined && allChildrenResident && !anyChildEvictionPending;
+            if (anyChildEvictionPending || (lvl <= nodeTargetLOD && !keepRefined))
             {
                 if (currentChunk.transitionProgress > 0.0f)
                 {
@@ -2718,15 +2736,18 @@ namespace Surfels
                     auto& c = m_lodStreamChunks[finerLvl][ci];
                     c.isLockedInTransition = false;
 
-                    // Demotion no longer evicts the children (either policy): the octahedron face lists keep
-                    // every level of the visible faces resident ahead of need, so an eviction here was only
-                    // ever undone by the next frame's stream -- and with refinement now instant on resident
-                    // children, that refine / demote / evict / re-deliver loop flashed the model in and out of
-                    // its finer level whenever an edge flag flickered. Only a decay-marked child is evicted
-                    // (c.isEvictionPending, set by the LRU decay pass above); zooming out simply stops
-                    // showing the finer level, and Decay is what reclaims memory.
+                    // In Conservative mode: evict non-silhouette Level N-1 child chunks upon demotion completion --
+                    // but only if this node had actually refined into them (hasRefined). Children that arrived
+                    // shown are kept: evicting them here would just make the face streams re-deliver them.
+                    // In Greedy mode, only evict if THIS chunk was explicitly decay-marked (c.isEvictionPending,
+                    // set by the LRU decay pass above) -- otherwise Greedy's normal "keep it cached, don't
+                    // thrash" behavior is preserved. Without the isEvictionPending clause, decay had no effect
+                    // at all under Greedy (the default streaming policy): it would set isEvictionPending = true,
+                    // this whole block would be skipped every time, and the flag would just stay stuck true
+                    // forever -- resident memory was never actually reclaimed no matter how high the decay
+                    // rate or how low the bandwidth throttle was set.
                     // (Never evict highest two mip levels: coarsestLvl and coarsestLvl - 1)
-                    if (c.isEvictionPending && (!c.isSilhouette || anyChildEvictionPending))
+                    if (((m_streamingPolicy == StreamingPolicy::Conservative && currentChunk.hasRefined && !currentChunk.refinedBySilhouette) || c.isEvictionPending) && (!c.isSilhouette || anyChildEvictionPending))
                     {
                         if (finerLvl < coarsestLvl - 1)
                         {
@@ -2748,6 +2769,8 @@ namespace Surfels
                     }
                 }
 
+                currentChunk.refinedBySilhouette = false;
+
                 // Render current parent chunk as 100% solid
                 AppendChunkToRenderer(&currentChunk, parentFactor, isSilhouette);
                 return;
@@ -2758,6 +2781,25 @@ namespace Surfels
             // =========================================================================
             if (allChildrenResident && currentChunk.isResident)
             {
+                if (currentChunk.transitionProgress <= 0.0f && lvl <= targetLOD)
+                {
+                    // An edge-driven start (only an edge flag brings a node at or below the target here).
+                    // If the children did not just arrive, it counts against this frame's cap.
+                    bool justStreamed = false;
+                    for (size_t ci = childStart; ci < childEnd && !justStreamed; ci++)
+                        justStreamed = m_lodStreamChunks[finerLvl][ci].streamWaveTimer > 0.0f;
+                    if (!justStreamed)
+                    {
+                        if (m_edgeRefineStartsThisFrame >= kEdgeRefineStartsPerFrame)
+                        {
+                            AppendChunkToRenderer(&currentChunk, parentFactor, isSilhouette);
+                            return;
+                        }
+                        m_edgeRefineStartsThisFrame++;
+                    }
+                }
+                currentChunk.hasRefined = true; // Children are being shown: dropping back to this node later evicts them (CASE 1)
+                if (currentChunk.transitionProgress <= 0.0f) currentChunk.refinedBySilhouette = (lvl <= targetLOD); // Edge-driven refinement: keep the children on demotion
                 currentChunk.transitionProgress = std::min(1.0f, currentChunk.transitionProgress + progressStep);
                 float t = m_enableDitheredTransitions ? currentChunk.transitionProgress : 1.0f;
 
@@ -2829,6 +2871,7 @@ namespace Surfels
         {
             TraverseNode(coarsestLvl, r, 1.0f);
         }
+        m_frameTraversalMs = std::chrono::duration<float, std::milli>(std::chrono::high_resolution_clock::now() - tTraversalStart).count();
 
         m_state.surfelCount = (uint32_t)(m_enableQuantization ? (!m_unifiedPackedSurfels.empty() ? m_unifiedPackedSurfels.size() : m_rendererSurfels.size()) : (!m_unifiedRawSurfels.empty() ? m_unifiedRawSurfels.size() : m_rendererRawSurfels.data() ? m_rendererRawSurfels.size() : 0));
 
@@ -3223,7 +3266,14 @@ namespace Surfels
         {
             if (m_enableStreamingSimulation)
             {
+                const auto tSim = std::chrono::high_resolution_clock::now();
                 UpdateStreamingSimulation(m_deltaTime / 1000.0);
+                m_frameSimMs = std::chrono::duration<float, std::milli>(std::chrono::high_resolution_clock::now() - tSim).count();
+            }
+            else
+            {
+                m_frameSimMs = 0.0f;
+                m_frameTraversalMs = 0.0f;
             }
         }
 
@@ -3621,6 +3671,11 @@ namespace Surfels
                         }
                         ImGui::PopItemWidth();
                     }
+                    if (ImGui::Checkbox("Demote Chunks on Zoom Out", &m_demoteChunks))
+                    {
+                        m_streamStateDirty = true;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Off: once a chunk has refined into its children it stays refined when you zoom out or its edge flag drops, so detail never fades back to the coarser level (Decay still reclaims memory). On: children cross-fade back to the parent and are evicted, as in v1.2.0.");
 
                     ImGui::Separator();
                     if (ImGui::Checkbox("Highlight Edge Chunks", &m_highlightSilhouetteChunks))
@@ -4105,6 +4160,30 @@ namespace Surfels
             {
                 ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "  • TAA Resolve:                      %.2f ms", m_pRenderer->GetSmoothTaaMs());
             }
+
+            // Where the frame time actually goes. The stage lines above are the CPU cost of recording each
+            // pass; this is the whole frame on the CPU wall clock, so the sum approaches the total.
+            ImGui::Separator();
+            ImGui::Text("Frame Budget (CPU wall clock, ms):");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Where the frame time goes, measured on the CPU. The stage lines above are command-recording costs only. GPU wait is the CPU blocked on the swapchain fence, i.e. waiting for the GPU (or VSync): a large value there means the GPU is the bottleneck.");
+            {
+                const float traversal = m_budgetShown[kBudgetTraversal];
+                const float simOther = std::max(0.0f, m_budgetShown[kBudgetSim] - traversal);
+                const float ui = m_budgetShown[kBudgetUi];
+                const float gpuWait = m_budgetShown[kBudgetGpuWait];
+                const float record = m_budgetShown[kBudgetRecord];
+                const float present = m_budgetShown[kBudgetPresent];
+                const float accounted = traversal + simOther + ui + gpuWait + record + present;
+                const float other = std::max(0.0f, metrics.totalFrameTimeMs - accounted);
+                const ImVec4 cpuCol(0.95f, 0.85f, 0.55f, 1.0f), gpuCol(0.55f, 0.85f, 1.0f, 1.0f), dimCol(0.6f, 0.6f, 0.6f, 1.0f);
+                ImGui::TextColored(cpuCol, "  \xe2\x80\xa2 LOD traversal & render list:      %.2f ms", traversal);
+                ImGui::TextColored(cpuCol, "  \xe2\x80\xa2 Streaming delivery & queues:      %.2f ms", simOther);
+                ImGui::TextColored(cpuCol, "  \xe2\x80\xa2 UI build (ImGui):                 %.2f ms", ui);
+                ImGui::TextColored(gpuCol, "  \xe2\x80\xa2 GPU wait (swapchain fence):       %.2f ms", gpuWait);
+                ImGui::TextColored(cpuCol, "  \xe2\x80\xa2 Command recording & uploads:      %.2f ms", record);
+                ImGui::TextColored(cpuCol, "  \xe2\x80\xa2 Present:                          %.2f ms", present);
+                ImGui::TextColored(dimCol, "  \xe2\x80\xa2 Other (input, window, OS):        %.2f ms", other);
+            }
         }
 
         // Compression Summary
@@ -4396,8 +4475,8 @@ namespace Surfels
 
                 ImGui::Text("Author:       Dave Wilkinson");
                 ImGui::Text("Organization: Blueshell LLC");
-                ImGui::Text("Version:      v1.2.1");
-                ImGui::Text("Date:         September 6, 2026");
+                ImGui::Text("Version:      v1.1.0");
+                ImGui::Text("Date:         September 7, 2026");
                 if (m_pRenderer) ImGui::Text("GPU path:     %s", m_pRenderer->GetRenderPathDescription());
                 ImGui::Spacing();
                 ImGui::Separator();
@@ -4830,9 +4909,8 @@ namespace Surfels
         {
             // The four faces of this half: octants with the matching Y sign. Each is the triangle from the
             // centre (the +Y or -Y apex, seen end-on) to the two equatorial vertices of its X and Z signs.
-            // Two passes: every fill first, then every outline, so a face's progress fill can never cover
-            // the divider it shares with a neighbour; the progress fill is semi-transparent for the same
-            // reason, so the dividers read through it at any fill level.
+            // Two passes: every fill first, then every outline, so the outline and cross bars are always
+            // drawn on top at full opacity whatever the fills are doing.
             for (int pass = 0; pass < 2; pass++)
             for (int f = 0; f < kOctahedronFaces; f++)
             {
@@ -4841,37 +4919,34 @@ namespace Surfels
                 ImVec2 px(c.x + sx * R, c.y), pz(c.x, c.y + sz * R);
                 const bool vis = (m_visibleFaceMask & (1u << f)) != 0;
                 const float t = vis ? std::max(0.0f, std::min(1.0f, (m_faceFacing[f] + 0.15f) / 1.15f)) : 0.0f;
-                ImU32 fill, line;
-                if (upper)
-                {
-                    fill = vis ? IM_COL32((int)(35 + 20 * t), (int)(110 + 70 * t), (int)(55 + 25 * t), 190) : IM_COL32(40, 40, 46, 150);
-                    line = vis ? IM_COL32((int)(50 + 22 * (1 - t)), (int)(120 + 70 * t), (int)(62 + 30 * t), 255) : IM_COL32(52, 54, 60, 255);
-                }
-                else
-                {
-                    fill = vis ? IM_COL32((int)(70 + 20 * t), (int)(110 + 40 * t), (int)(170 + 50 * t), 190) : IM_COL32(40, 42, 50, 150);
-                    line = vis ? IM_COL32((int)(90 + 30 * (1 - t)), (int)(128 + 38 * t), (int)(172 + 20 * t), 255) : IM_COL32(52, 56, 64, 255);
-                }
+                // Bevelled look: each face is shaded as one side of a low pyramid seen from above, lit from
+                // the upper left (both halves are drawn that way so they read alike); its two ridge edges
+                // (centre to rim) are light on the lit side and dark on the shaded side, its rim edge dark.
+                const float lx = -0.55f, ly = 0.65f, lz = -0.52f;           // Light direction: from the upper left, above
+                const float nx = sx * 0.577f, ny = 0.577f, nz = sz * 0.577f;  // Face normal of the pyramid side
+                const float ndotl = nx * lx + ny * ly + nz * lz;
+                const float shade = 0.55f + 0.45f * std::max(0.0f, std::min(1.0f, ndotl + 0.2f)); // 0.55 .. 1.0
+                float br, bg, bb;                                            // Base colour of this face
+                if (upper) { br = vis ? 55.0f + 30.0f * t : 60.0f;  bg = vis ? 170.0f + 70.0f * t : 66.0f; bb = vis ? 85.0f + 35.0f * t : 74.0f; }
+                else       { br = vis ? 100.0f + 30.0f * t : 60.0f; bg = vis ? 150.0f + 45.0f * t : 64.0f; bb = vis ? 225.0f + 30.0f * t : 78.0f; }
+                auto shaded = [&](float k, int alpha) { return IM_COL32((int)std::min(255.0f, br * k), (int)std::min(255.0f, bg * k), (int)std::min(255.0f, bb * k), alpha); };
+                // Fill opacity is the face's residency: 0% with nothing loaded, 80% with every block loaded,
+                // every grade between. The outline and cross bars below are always fully opaque.
+                float done = 0.0f;
+                if (m_faceTotal[f] > 0) done = 1.0f - (float)std::min(m_faceRemaining[f], m_faceTotal[f]) / (float)m_faceTotal[f];
+                const ImU32 fill = shaded(shade, (int)(204.0f * std::max(0.0f, std::min(1.0f, done))));
                 if (pass == 1)
                 {
-                    dl->AddTriangle(c, px, pz, line, vis ? 2.0f : 1.0f);
+                    const bool lit = ndotl > 0.05f;
+                    const ImU32 ridge = lit ? shaded(1.35f, 255) : shaded(0.45f, 255);
+                    const ImU32 rim = shaded(0.40f, 255);
+                    const float w = vis ? 2.0f : 1.0f;
+                    dl->AddLine(c, px, ridge, w);
+                    dl->AddLine(c, pz, ridge, w);
+                    dl->AddLine(px, pz, rim, w);
                     continue;
                 }
                 dl->AddTriangleFilled(c, px, pz, fill);
-                // Fill progress: a triangle growing from the diamond's centre point outward to the rim,
-                // area proportional to the share of the face's blocks that are resident, so every visible
-                // face can be seen streaming its own list at once. 30% opacity keeps the dividers visible.
-                if (m_faceTotal[f] > 0)
-                {
-                    const float done = 1.0f - (float)std::min(m_faceRemaining[f], m_faceTotal[f]) / (float)m_faceTotal[f];
-                    const float sc = sqrtf(std::max(0.0f, std::min(1.0f, done)));
-                    if (sc > 0.02f)
-                    {
-                        auto lerp = [&](const ImVec2& v) { return ImVec2(c.x + (v.x - c.x) * sc, c.y + (v.y - c.y) * sc); };
-                        const ImU32 prog = upper ? IM_COL32(120, 235, 150, vis ? 77 : 40) : IM_COL32(150, 205, 255, vis ? 77 : 40);
-                        dl->AddTriangleFilled(c, lerp(px), lerp(pz), prog);
-                    }
-                }
             }
             // Camera marker: its horizontal direction, on this half if the camera is on this side of the equator.
             const bool camHere = (m_camDir[1] >= 0.0f) == upper;
@@ -5947,7 +6022,9 @@ namespace Surfels
             m_fitViewPending = false;
         }
         UpdateCamera(ImGui::GetIO());
+        const auto tUi = std::chrono::high_resolution_clock::now();
         BuildUI();
+        m_frameUiMs = std::chrono::duration<float, std::milli>(std::chrono::high_resolution_clock::now() - tUi).count();
         m_state.time += (float)(m_deltaTime / 1000.0);
         m_state.enableDithering = m_enableDitheredTransitions;
         m_state.highlightSilhouette = m_highlightSilhouetteChunks;
@@ -5981,8 +6058,28 @@ namespace Surfels
 
         try
         {
+            const auto tRender = std::chrono::high_resolution_clock::now();
             m_pRenderer->OnRender(&m_state, &m_swapChain);
+            const auto tPresent = std::chrono::high_resolution_clock::now();
             EndFrame();
+            const auto tDone = std::chrono::high_resolution_clock::now();
+            m_frameRenderMs = std::chrono::duration<float, std::milli>(tPresent - tRender).count();
+            m_framePresentMs = std::chrono::duration<float, std::milli>(tDone - tPresent).count();
+            // Window the frame budget: sum per frame, publish the mean every 250 ms.
+            m_budgetAccum[kBudgetSim] += m_frameSimMs;
+            m_budgetAccum[kBudgetTraversal] += m_frameTraversalMs;
+            m_budgetAccum[kBudgetUi] += m_frameUiMs;
+            m_budgetAccum[kBudgetGpuWait] += m_pRenderer->GetLastGpuWaitMs();
+            m_budgetAccum[kBudgetRecord] += m_pRenderer->GetLastCommandRecordMs();
+            m_budgetAccum[kBudgetPresent] += m_framePresentMs;
+            m_budgetAccumWallMs += (float)m_deltaTime;
+            m_budgetAccumFrames++;
+            if (m_budgetAccumWallMs >= 250.0f && m_budgetAccumFrames > 0)
+            {
+                for (int k = 0; k < kBudgetCount; k++) { m_budgetShown[k] = m_budgetAccum[k] / (float)m_budgetAccumFrames; m_budgetAccum[k] = 0.0f; }
+                m_budgetAccumWallMs = 0.0f;
+                m_budgetAccumFrames = 0;
+            }
         }
         catch (const std::exception& e)
         {

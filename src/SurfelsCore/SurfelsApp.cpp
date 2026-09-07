@@ -623,6 +623,11 @@ namespace Surfels
                 m_pendingAction = IsViewerOnly() ? PendingAction::OpenCompressedFile : PendingAction::OpenFile;
                 return true;
             }
+            else if (ctrlPressed && msg.wParam == 'D')
+            {
+                SetDetachCamera(!m_detachCamera);
+                return true;
+            }
             else if (ctrlPressed && msg.wParam == 'E' && !m_rawSurfels.empty() && !IsViewerOnly())
             {
                 m_pendingAction = PendingAction::ExportStream;
@@ -630,6 +635,47 @@ namespace Surfels
             }
         }
         return true;
+    }
+
+    // Detach Camera on: the culling camera freezes where the view is, and the view steps to the side,
+    // farther out, so the frozen frustum can be inspected. Off: the view returns to the frozen camera.
+    void SurfelsApp::SetDetachCamera(bool on)
+    {
+        if (on == m_detachCamera) return;
+        m_detachCamera = on;
+        if (on)
+        {
+            m_detachedYaw = m_yaw;
+            m_detachedPitch = m_pitch;
+            m_detachedDistance = m_distance;
+            m_detachedTarget = m_target;
+
+            const float cy = cosf(m_detachedPitch), sy = sinf(m_detachedPitch);
+            const float sx = sinf(m_detachedYaw), cx = cosf(m_detachedYaw);
+            XMFLOAT3 cullEyePos(
+                m_detachedTarget.x + m_detachedDistance * cy * sx,
+                m_detachedTarget.y + m_detachedDistance * sy,
+                m_detachedTarget.z + m_detachedDistance * cy * cx
+            );
+
+            m_yaw = m_detachedYaw + 1.5707963f;
+            m_pitch = 0.05f;
+            m_target = XMFLOAT3(
+                (m_detachedTarget.x + cullEyePos.x) * 0.5f,
+                m_detachedTarget.y,
+                (m_detachedTarget.z + cullEyePos.z) * 0.5f
+            );
+            float maxDim = std::max(m_extents.x, std::max(m_extents.y, m_extents.z));
+            m_distance = std::max(m_detachedDistance * 2.3f, maxDim * 2.2f);
+        }
+        else
+        {
+            m_yaw = m_detachedYaw;
+            m_pitch = m_detachedPitch;
+            m_distance = m_detachedDistance;
+            m_target = m_detachedTarget;
+        }
+        LogTransitionTrace("Detach Camera %s", on ? "on" : "off");
     }
 
     // Recreates window-size-dependent renderer resources
@@ -2077,17 +2123,24 @@ namespace Surfels
 
         int coarsestLvl = numLODs - 1;
 
-        // 1. Calculate Camera Position & View Frustum
-        const float cy = cosf(m_pitch), sy = sinf(m_pitch);
-        const float sx = sinf(m_yaw), cx = cosf(m_yaw);
+        // 1. Calculate Camera Position & View Frustum. With Detach Camera on, the traversal, the LOD choice
+        // and every request follow the FROZEN camera, so the model on screen is exactly what that camera
+        // would render (its levels, its culling) while the live camera only observes it. Following the
+        // live camera instead made the level drop to what the far-away observer wanted.
+        const float camPitch = m_detachCamera ? m_detachedPitch : m_pitch;
+        const float camYaw   = m_detachCamera ? m_detachedYaw : m_yaw;
+        const float camDist  = m_detachCamera ? m_detachedDistance : m_distance;
+        const XMFLOAT3 camTarget = m_detachCamera ? m_detachedTarget : m_target;
+        const float cy = cosf(camPitch), sy = sinf(camPitch);
+        const float sx = sinf(camYaw), cx = cosf(camYaw);
         XMFLOAT3 eyePos(
-            m_target.x + m_distance * cy * sx,
-            m_target.y + m_distance * sy,
-            m_target.z + m_distance * cy * cx
+            camTarget.x + camDist * cy * sx,
+            camTarget.y + camDist * sy,
+            camTarget.z + camDist * cy * cx
         );
 
         XMVECTOR eye = XMLoadFloat3(&eyePos);
-        XMVECTOR at = XMLoadFloat3(&m_target);
+        XMVECTOR at = XMLoadFloat3(&camTarget);
         XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
         XMMATRIX view = XMMatrixLookAtRH(eye, at, worldUp);
         XMMATRIX proj = XMMatrixPerspectiveFovRH(XM_PIDIV4, (float)m_Width / (float)std::max(1, (int)m_Height), 0.1f, 500.0f);
@@ -3436,7 +3489,9 @@ namespace Surfels
             if (m_autoLODCooldownTimer <= 0.0f)
             {
                 float maxDim = std::max(m_extents.x, std::max(m_extents.y, m_extents.z));
-                float normalizedDist = m_distance / std::max(0.1f, maxDim);
+                // Detach Camera: the level follows the frozen camera's distance, not the observer's.
+                const float lodDistance = m_detachCamera ? m_detachedDistance : m_distance;
+                float normalizedDist = lodDistance / std::max(0.1f, maxDim);
 
                 int maxLODIndex = (int)m_waveletResult.lodLevels.size() - 1;
 
@@ -4094,44 +4149,10 @@ namespace Surfels
                     ImGui::Checkbox("Use DX12 CopyQueue (Async DMA)", &m_useCopyQueue);
                     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses a dedicated D3D12_COMMAND_LIST_TYPE_COPY hardware DMA queue for PCIe buffer uploads in parallel with 3D rendering.");
 
-                    if (ImGui::Checkbox("Detach Camera (Freeze Culling Frustum)", &m_detachCamera))
-                    {
-                        if (m_detachCamera)
-                        {
-                            m_detachedYaw = m_yaw;
-                            m_detachedPitch = m_pitch;
-                            m_detachedDistance = m_distance;
-                            m_detachedTarget = m_target;
-
-                            const float cy = cosf(m_detachedPitch), sy = sinf(m_detachedPitch);
-                            const float sx = sinf(m_detachedYaw), cx = cosf(m_detachedYaw);
-                            XMFLOAT3 cullEyePos(
-                                m_detachedTarget.x + m_detachedDistance * cy * sx,
-                                m_detachedTarget.y + m_detachedDistance * sy,
-                                m_detachedTarget.z + m_detachedDistance * cy * cx
-                            );
-
-                            m_yaw = m_detachedYaw + 1.5707963f;
-                            m_pitch = 0.05f;
-
-                            m_target = XMFLOAT3(
-                                (m_detachedTarget.x + cullEyePos.x) * 0.5f,
-                                m_detachedTarget.y,
-                                (m_detachedTarget.z + cullEyePos.z) * 0.5f
-                            );
-
-                            float maxDim = std::max(m_extents.x, std::max(m_extents.y, m_extents.z));
-                            m_distance = std::max(m_detachedDistance * 2.3f, maxDim * 2.2f);
-                        }
-                        else
-                        {
-                            m_yaw = m_detachedYaw;
-                            m_pitch = m_detachedPitch;
-                            m_distance = m_detachedDistance;
-                            m_target = m_detachedTarget;
-                        }
-                    }
-                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Decouples the view and freezes the culling frustum, allowing inspection of culling boundaries from any angle: only what the frozen camera could see is drawn -- surfels inside its frustum and facing it, and likewise only the occlusion volume faces turned toward it -- so from the side both read as the open shell that camera saw.");
+                    bool detachToggle = m_detachCamera;
+                    if (ImGui::Checkbox("Detach Camera (Freeze Culling Frustum)", &detachToggle))
+                        SetDetachCamera(detachToggle);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Ctrl+D. Freezes the culling camera where the view is and steps the view aside so the culling can be inspected from any angle. The model is exactly what the frozen camera would render, its level of detail included: surfels it would draw keep their colour (mid grey where the viewer sees their back), everything it would have culled -- chunks outside its frustum or facing away, and the far side of the shell -- stays on screen in dark grey. The occlusion volume shows only the faces turned toward the frozen camera.");
                     if (m_detachCamera)
                     {
                         ImGui::SameLine();

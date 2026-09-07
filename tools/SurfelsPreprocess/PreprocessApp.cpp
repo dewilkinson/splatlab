@@ -2369,9 +2369,11 @@ namespace Surfels
                         {
                             pChunk->isSilhouette = true;
                             pChunk->silhouetteHysteresisTimer = 1.0f;
+                            pChunk->silhouetteAge += (float)dtSeconds;
                         }
                         else
                         {
+                            pChunk->silhouetteAge = 0.0f;
                             if (pChunk->silhouetteHysteresisTimer > 0.0f)
                             {
                                 pChunk->silhouetteHysteresisTimer = std::max(0.0f, pChunk->silhouetteHysteresisTimer - (float)dtSeconds);
@@ -2573,7 +2575,11 @@ namespace Surfels
             // model while spinning at a forced level, even though nothing should be transitioning at all.
             // Also requires m_enableSilhouetteLOD0 explicitly (not just isSilhouette): isSilhouette can now
             // be true from highlighting alone, which must never trigger the actual refinement behavior.
-            bool shouldRefineToLOD0 = m_enableSilhouetteLOD0 && isSilhouette && m_autoLOD;
+            // The edge flag must have held for a moment before it drives refinement below the target level.
+            // With the face lists keeping finer levels resident ahead of need, a refinement is instant, so a
+            // flag that flickers on and off as the model spins would otherwise flash the whole neighbourhood
+            // of the edge in and out of its finer level every frame.
+            bool shouldRefineToLOD0 = m_enableSilhouetteLOD0 && isSilhouette && m_autoLOD && currentChunk.silhouetteAge >= 0.25f;
             int nodeTargetLOD = shouldRefineToLOD0 ? silTargetLOD : targetLOD;
 
             // In Conservative mode: skip requesting/refining out-of-frustum chunks beyond the neighbor buffer
@@ -2707,18 +2713,15 @@ namespace Surfels
                     auto& c = m_lodStreamChunks[finerLvl][ci];
                     c.isLockedInTransition = false;
 
-                    // In Conservative mode: evict non-silhouette Level N-1 child chunks upon demotion completion --
-                    // but only if this node had actually refined into them (hasRefined). Children that arrived
-                    // shown are kept: evicting them here would just make the face streams re-deliver them.
-                    // In Greedy mode, only evict if THIS chunk was explicitly decay-marked (c.isEvictionPending,
-                    // set by the LRU decay pass above) -- otherwise Greedy's normal "keep it cached, don't
-                    // thrash" behavior is preserved. Without the isEvictionPending clause, decay had no effect
-                    // at all under Greedy (the default streaming policy): it would set isEvictionPending = true,
-                    // this whole block would be skipped every time, and the flag would just stay stuck true
-                    // forever -- resident memory was never actually reclaimed no matter how high the decay
-                    // rate or how low the bandwidth throttle was set.
+                    // Demotion no longer evicts the children (either policy): the octahedron face lists keep
+                    // every level of the visible faces resident ahead of need, so an eviction here was only
+                    // ever undone by the next frame's stream -- and with refinement now instant on resident
+                    // children, that refine / demote / evict / re-deliver loop flashed the model in and out of
+                    // its finer level whenever an edge flag flickered. Only a decay-marked child is evicted
+                    // (c.isEvictionPending, set by the LRU decay pass above); zooming out simply stops
+                    // showing the finer level, and Decay is what reclaims memory.
                     // (Never evict highest two mip levels: coarsestLvl and coarsestLvl - 1)
-                    if (((m_streamingPolicy == StreamingPolicy::Conservative && currentChunk.hasRefined) || c.isEvictionPending) && (!c.isSilhouette || anyChildEvictionPending))
+                    if (c.isEvictionPending && (!c.isSilhouette || anyChildEvictionPending))
                     {
                         if (finerLvl < coarsestLvl - 1)
                         {
@@ -2740,7 +2743,6 @@ namespace Surfels
                     }
                 }
 
-
                 // Render current parent chunk as 100% solid
                 AppendChunkToRenderer(&currentChunk, parentFactor, isSilhouette);
                 return;
@@ -2751,7 +2753,6 @@ namespace Surfels
             // =========================================================================
             if (allChildrenResident && currentChunk.isResident)
             {
-                currentChunk.hasRefined = true; // Children are being shown: dropping back to this node later evicts them (CASE 1)
                 currentChunk.transitionProgress = std::min(1.0f, currentChunk.transitionProgress + progressStep);
                 float t = m_enableDitheredTransitions ? currentChunk.transitionProgress : 1.0f;
 

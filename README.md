@@ -32,15 +32,11 @@ The apps sit on AMD's [Cauldron](https://github.com/GPUOpen-LibrariesAndSDKs/Cau
 
 3. **`surfels_core` (Core)**. `src/SurfelsCore/`, the static library both executables are built from: the app shell (`SurfelsApp`, with its Studio / Viewer mode and command-line parsing), the renderer (`SurfelsRenderer`), the `.ply` / `.splat` / `.sog` loaders, the octree, quantizer and packager, the `.sflw` types and format validators (`WaveletTypes.h`), the HLSL shaders (copied to `bin/ShaderLibDX` at build time) and the shared `WinMain` body with its crash-dump handlers (`AppEntry.cpp`). Anything both apps need lives here. The console tools include its headers directly and need neither a GPU nor Cauldron.
 
-4. **`bluesec-codec` (Core)**. `libs/bluesec-codec/`, the algorithm core: the lifting-wavelet decomposition, the byte-shuffle and run-length codec, the interior occlusion volume generator, and the streaming scheduler with the detail grid it reads. In this repository these are proprietary source: each module is a public header (data structures and declarations) plus a `.cpp` implementation, built as a static library that `SplatLab`, `Surfels_DX12` and the console tools link against. **This subtree is not covered by the repository's Apache-2.0 `LICENSE`**; see `libs/bluesec-codec/README.md` for the boundary and its limits. A static library keeps source out of ordinary distribution but does not prevent disassembly of a shipped binary, and the shader source under `src/SurfelsCore/Shaders/` ships as plain text in `bin/ShaderLibDX/` regardless.
+4. **`bluesec-codec` (Core)**. `libs/bluesec-codec/`, the algorithm core: the lifting-wavelet decomposition, the byte-shuffle and run-length codec, the interior occlusion volume generator, and the streaming scheduler with the detail grid it reads. In the private original these are proprietary source. **This public repository ships them as prebuilt static libraries** (`libs/bluesec-codec/prebuilt/{Debug,Release}/bluesec-codec.lib`, through Git LFS, the same way Cauldron is shipped), so the public build has the complete feature set: real occlusion volume bakes, real wavelet levels, the real streaming order, and packages interchangeable with the private build's. The two `.lib` files are proprietary object code, **not** covered by the Apache-2.0 `LICENSE`: they come under the bluesec-codec Binary License in `libs/bluesec-codec/prebuilt/LICENSE.txt`, which allows using them, copying them with the repository and shipping them in builds of the project, but not redistributing them on their own or reverse engineering them. The directory also carries open, simplified stand-in sources (plain decimation, an uncompressed codec, no occlusion volume, a plain streaming order) that CMake compiles whenever the prebuilt library cannot be used (LFS objects not pulled, a non-MSVC toolchain, or `-DBLUESEC_CODEC_USE_PREBUILT=OFF`). A build running the stand-ins shows a red `CODEC:` banner row naming what it lacks, and packages it writes are not readable by the prebuilt codec or vice versa. See `libs/bluesec-codec/README.md`. The headers are the same in both forms, so `SplatLab`, `Surfels_DX12` and the console tools link against either unchanged.
 
 5. **Tests**. `tests/`, small console executables: `TestBitonicCPU` (CPU reference for the sort network), `TestGPUSort` (runs the radix sort on a raw D3D12 device against a CPU sort), `TestGeometryCull` (culling statistics), `TestLoadPackage` (loads a package and prints its counts), `TestOcclusionVolume` (runs the occlusion generator on a package) and `CompressVenus` (command-line packager, used to regenerate the bundled assets).
 
 6. **Docs** lists `README.md` and `docs/USER_GUIDE.md` in Solution Explorer. **ThirdParty/Cauldron** holds every vendored Cauldron target.
-
-### Public repository
-
-`https://github.com/dewilkinson/splatlab` is a generated public mirror of this repository. The proprietary source of `bluesec-codec` is replaced by prebuilt `.lib` binaries of the same code, with open stand-in sources as a fallback, so the public build has the full feature set while the algorithm source never appears in its history. `python scripts/sync-public-repo.py`, run from a clean working tree, rebuilds the mirror: it strips the proprietary paths from every commit, rewrites the contents of past revisions through `scripts/public-history-scrub.py` (the streaming scheduler and detail-grid scoring lived inside the app source before 2026-09-07, so those passages, the paragraphs describing them and the commit messages naming them are removed from every public commit), drops in the stand-ins, compiles this repository's codec into the prebuilt `.lib` files, swaps a few README passages, builds the result, regenerates the bundled packages, runs the stress test and pushes every branch and tag. `--no-push` inspects the result first; `--no-prebuilt-codec` publishes a stand-in-only build. `scripts/build-release.py` assembles the release zip from the built public tree.
 
 ### Package format (`.sflw`)
 
@@ -79,8 +75,8 @@ Surfels_DX12.exe [options] [file]
 Prerequisites, per [Cauldron's README](https://github.com/GPUOpen-LibrariesAndSDKs/Cauldron): CMake 3.24 or newer and Visual Studio 2019 or newer (MSVC toolset 142+) with the Windows 10 SDK. No Vulkan SDK is needed; the root `CMakeLists.txt` forces `GFX_API=DX12`.
 
 ```bat
-git clone --recurse-submodules https://github.com/dewilkinson/surfels.git
-cd surfels
+git clone --recurse-submodules https://github.com/dewilkinson/splatlab.git
+cd splatlab
 mkdir build && cd build
 cmake .. -G "Visual Studio 18 2026" -A x64
 ```
@@ -116,7 +112,7 @@ The public repository at `github.com/dewilkinson/splatlab` is a generated mirror
 
 ## License
 
-The source code in this repository is licensed under the [Apache License, Version 2.0](LICENSE), with these exceptions:
+The source code in this repository is licensed under the [Apache License, Version 2.0](LICENSE), with the exceptions listed in [NOTICE](NOTICE):
 
-- `libs/bluesec-codec/` (the proprietary algorithm core) is **All Rights Reserved** and not covered by the Apache License; see that directory's README for the boundary. The public mirror ships it as prebuilt binaries under the bluesec-codec Binary License (`scripts/public-release-stubs/libs/bluesec-codec/prebuilt/LICENSE.txt`), which lets anyone use the binaries, copy them with the repository and ship them inside builds of the project.
+- `libs/bluesec-codec/prebuilt/` holds prebuilt proprietary binaries of the bluesec-codec library, licensed under the [bluesec-codec Binary License](libs/bluesec-codec/prebuilt/LICENSE.txt). You may use them, copy them together with this repository (forks included) and ship them inside builds of this project, commercially or otherwise; you may not distribute them on their own or reverse engineer them. The headers and open stand-in sources next to them are Apache-2.0.
 - `libs/cauldron/` is AMD's Cauldron framework under the MIT License (`libs/cauldron/license.txt`, third-party notices in `libs/cauldron/NOTICES.txt`).
